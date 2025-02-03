@@ -1,0 +1,7 @@
+*.txt
+*.csv
+*.xml
+*.pem
+*.tar
+commands.sh
+*/
