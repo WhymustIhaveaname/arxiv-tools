@@ -64,5 +64,9 @@ def select_yymm(yymm_perfix):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--yymm', type=str, default='0406')
+    parser.add_argument('--stat', action='store_true')
     args = parser.parse_args()
-    select_yymm(args.yymm)
+    if args.stat:
+        stat_yymm()
+    else:
+        select_yymm(args.yymm)

@@ -1,6 +1,6 @@
 *.txt
 *.csv
-*.xml
+*.png
 *.pem
 *.tar
 commands.sh
