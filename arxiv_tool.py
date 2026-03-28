@@ -50,6 +50,8 @@ import json5
 import requests
 from dotenv import load_dotenv
 
+from paper_cache import CachedAuthor, CachedPaper, cache_paper, get_cached_bibtex, get_cached_paper
+
 if TYPE_CHECKING:
     from arxiv import Result
 
@@ -134,17 +136,35 @@ class RateLimiter:
         cls._write(lock)
 
 
-def get_paper_info(arxiv_id: str) -> Result | None:
+def get_paper_info(arxiv_id: str) -> Result | CachedPaper | None:
     clean_id = extract_arxiv_id(arxiv_id)
+
+    cached = get_cached_paper(clean_id)
+    if cached:
+        return cached
+
     RateLimiter.wait("arxiv")
     RateLimiter.record("arxiv")
     client = arxiv.Client()
     search = arxiv.Search(id_list=[clean_id])
     results = list(client.results(search))
-    if results:
-        return results[0]
-    print(f"未找到论文: {clean_id}", file=sys.stderr)
-    return None
+    if not results:
+        print(f"未找到论文: {clean_id}", file=sys.stderr)
+        return None
+
+    paper = results[0]
+    cached_paper = CachedPaper(
+        title=paper.title,
+        authors=[CachedAuthor(a.name) for a in paper.authors],
+        summary=paper.summary,
+        published=paper.published,
+        updated=paper.updated,
+        categories=list(paper.categories),
+        pdf_url=paper.pdf_url,
+    )
+    bibtex = generate_bibtex(paper, clean_id)
+    cache_paper(clean_id, cached_paper, bibtex)
+    return paper
 
 
 def sanitize_filename(name: str, max_length: int = 80) -> str:
@@ -460,11 +480,12 @@ def generate_bibtex(paper: Result, arxiv_id: str) -> str:
 def cmd_bib(args):
     clean_id = extract_arxiv_id(args.arxiv_id)
 
+    # 确保缓存中有数据
     paper = get_paper_info(clean_id)
     if not paper:
         sys.exit(1)
 
-    bibtex = generate_bibtex(paper, clean_id)
+    bibtex = get_cached_bibtex(clean_id) or generate_bibtex(paper, clean_id)
 
     if args.output:
         output_path = Path(args.output)

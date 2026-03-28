@@ -4,4 +4,5 @@
 *.pyc
 __pycache__/
 .ratelimit.lock
+.paper_cache.db
 .pytest_cache/
