@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import requests
 
 import arxiv_tool
 
@@ -556,28 +557,22 @@ class TestTryRenameWithTitle:
 # ════════════════════════════════════════════════════════════════════
 
 
-class TestCmdFetchFailure:
-    """cmd_fetch 失败场景"""
+class TestFetchPdfFallback:
+    """_fetch_pdf_fallback 失败场景"""
 
     def test_download_failure_raises(self, tmp_path):
         """PDF 下载失败（HTTP 错误）应抛异常"""
-        import requests
-
         with patch("arxiv_tool.requests.get") as mock_get:
             mock_get.return_value.raise_for_status.side_effect = requests.HTTPError("404")
-            args = argparse.Namespace(arxiv_id=TEST_ID, output=str(tmp_path))
             with pytest.raises(requests.HTTPError):
-                arxiv_tool.cmd_fetch(args)
+                arxiv_tool._fetch_pdf_fallback(TEST_ID, tmp_path)
 
     def test_old_format_id_slash_replaced(self, tmp_path):
         """旧格式 ID 的 / 应被替换为 _ 用于文件名"""
-        import requests
-
         with patch("arxiv_tool.requests.get") as mock_get:
             mock_get.return_value.raise_for_status.side_effect = requests.HTTPError("404")
-            args = argparse.Namespace(arxiv_id="cs/0401001", output=str(tmp_path))
             with pytest.raises(requests.HTTPError):
-                arxiv_tool.cmd_fetch(args)
+                arxiv_tool._fetch_pdf_fallback("cs/0401001", tmp_path)
             # 验证请求的 URL 使用了正确的 arXiv ID
             call_url = mock_get.call_args[0][0]
             assert "cs/0401001" in call_url
@@ -588,8 +583,6 @@ class TestFetchTexSourceFailure:
 
     def test_download_failure_returns_none(self, tmp_path):
         """源文件下载失败返回 None"""
-        import requests
-
         with patch("arxiv_tool.requests.get") as mock_get:
             mock_get.side_effect = requests.RequestException("mocked network error")
             result = arxiv_tool.fetch_tex_source("9999.99999", tmp_path)
@@ -707,16 +700,15 @@ class TestCmdBib:
                 arxiv_tool.cmd_bib(args)
 
 
-class TestCmdFetch:
-    """cmd_fetch CLI 行为"""
+class TestFetchPdfFallbackCached:
+    """_fetch_pdf_fallback 缓存行为"""
 
     def test_cached_returns_existing(self, tmp_path, capsys):
         """txt 已存在时跳过下载"""
         txt = tmp_path / f"{TEST_ID}.txt"
         txt.write_text("cached")
 
-        args = argparse.Namespace(arxiv_id=TEST_ID, output=str(tmp_path))
-        arxiv_tool.cmd_fetch(args)
+        arxiv_tool._fetch_pdf_fallback(TEST_ID, tmp_path)
 
         out = capsys.readouterr().out
         assert "文件已存在" in out
@@ -742,12 +734,13 @@ class TestCmdTex:
         assert "main.tex" in out
         assert "ref.bib" in out
 
-    def test_failure_exits(self):
-        """下载失败时 sys.exit(1)"""
-        with patch("arxiv_tool.fetch_tex_source", return_value=None):
+    def test_failure_falls_back_to_pdf(self, capsys):
+        """tex 失败时 fallback 到 PDF 下载"""
+        with patch("arxiv_tool.fetch_tex_source", return_value=None), \
+             patch("arxiv_tool._fetch_pdf_fallback") as mock_fallback:
             args = argparse.Namespace(arxiv_id=TEST_ID, output="/tmp")
-            with pytest.raises(SystemExit, match="1"):
-                arxiv_tool.cmd_tex(args)
+            arxiv_tool.cmd_tex(args)
+            mock_fallback.assert_called_once()
 
 
 class TestCmdCited:
@@ -1018,11 +1011,9 @@ class TestRateLimiter:
     @pytest.fixture(autouse=True)
     def _clean_lock(self):
         """每个测试前后清理 lock 文件"""
-        if arxiv_tool.RateLimiter.LOCK_FILE.exists():
-            arxiv_tool.RateLimiter.LOCK_FILE.unlink()
+        arxiv_tool.RateLimiter.LOCK_FILE.unlink(missing_ok=True)
         yield
-        if arxiv_tool.RateLimiter.LOCK_FILE.exists():
-            arxiv_tool.RateLimiter.LOCK_FILE.unlink()
+        arxiv_tool.RateLimiter.LOCK_FILE.unlink(missing_ok=True)
 
     def test_available_when_no_lock(self):
         assert arxiv_tool.RateLimiter.available("ut") is True
@@ -1078,7 +1069,6 @@ class TestRateLimiter:
         assert not arxiv_tool.RateLimiter.LOCK_FILE.exists()
 
 
-
 # ════════════════════════════════════════════════════════════════════
 #  7. 集成测试（需要网络）—— 以 1706.03762 为例
 # ════════════════════════════════════════════════════════════════════
@@ -1115,12 +1105,11 @@ class TestGetPaperInfo:
 
 
 @network
-class TestFetchPaper:
-    """cmd_fetch 集成测试（下载 PDF + 转 txt）"""
+class TestFetchPdfFallbackIntegration:
+    """_fetch_pdf_fallback 集成测试（下载 PDF + 转 txt）"""
 
     def test_download_creates_pdf_and_txt(self, tmp_path):
-        args = argparse.Namespace(arxiv_id=TEST_ID, output=str(tmp_path))
-        arxiv_tool.cmd_fetch(args)
+        arxiv_tool._fetch_pdf_fallback(TEST_ID, tmp_path)
 
         txt = tmp_path / f"{TEST_ID}.txt"
         pdf = tmp_path / f"{TEST_ID}.pdf"
@@ -1138,8 +1127,7 @@ class TestFetchPaper:
         txt = tmp_path / f"{TEST_ID}.txt"
         txt.write_text("cached")
 
-        args = argparse.Namespace(arxiv_id=TEST_ID, output=str(tmp_path))
-        arxiv_tool.cmd_fetch(args)
+        arxiv_tool._fetch_pdf_fallback(TEST_ID, tmp_path)
         assert txt.read_text() == "cached"
         assert "文件已存在" in capsys.readouterr().out
 

@@ -19,16 +19,15 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" <subcommand> [args]
 |---------|---------|---------|
 | `search "keywords"` | Search papers (S2 → OpenAlex → arXiv fallback) | `search "PINN" --max 10` |
 | `info <ID>` | Get paper metadata without downloading | `info 2401.12345` |
-| `tex <ID>` | Download LaTeX source (preferred for full text) | `tex 2401.12345` |
-| `fetch <ID>` | Download PDF + extract text (fallback if tex fails) | `fetch 2401.12345` |
+| `tex <ID>` | Download full text (LaTeX first, auto PDF fallback) | `tex 2401.12345` |
 | `bib <ID>` | Generate BibTeX citation | `bib 2401.12345 -o refs.bib` |
 | `cited <ID>` | Reverse citation lookup | `cited 1711.10561 --max 50` |
 
 ## Rules
 
-1. **tex before fetch**: Always try `tex` first for full text. It gives original LaTeX source with perfect formatting. Only use `fetch` if `tex` fails (e.g. no source available).
+1. **Use `tex` for full text**: It tries LaTeX source first (perfect formatting), and automatically falls back to PDF download if source is unavailable. No need to handle fallback manually.
 2. **tex before bib**: If `tex` already downloaded, read `references.bib` or `.bbl` from the source directory directly — don't call `bib` separately.
-3. **Rate limits**: arXiv API is strict (3s intervals). Don't chain `info`/`bib` calls without pauses. `fetch`/`tex` download files directly and are less restricted.
+3. **Rate limits**: arXiv API is strict (3s intervals). Don't chain `info`/`bib` calls without pauses. `tex` downloads files directly and is less restricted.
 
 ## Output
 

@@ -41,22 +41,14 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "关键词" --source s2|open
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info <arXiv ID>
 ```
 
-### tex — 下载 LaTeX 源文件（获取全文首选）
+### tex — 下载论文全文（LaTeX 源文件优先，PDF 自动 fallback）
 
 ```bash
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" tex <arXiv ID>
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" tex <arXiv ID> -o ./my_papers
 ```
 
-下载源文件并解压到 `arxiv/{arxiv_id}_{title}/`，保留完整 LaTeX 格式和图片。
-
-### fetch — 下载 PDF 并提取文本（tex 失败时的备选）
-
-```bash
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fetch <arXiv ID>
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fetch <arXiv ID> -o ./my_papers
-```
-
-保存到插件目录下的 `arxiv/`，生成 `{id}.pdf` 和 `{id}.txt`。
+下载源文件并解压到 `arxiv/{arxiv_id}_{title}/`，保留完整 LaTeX 格式和图片。若源文件不可用，自动 fallback 到 PDF 下载并提取文本。
 
 ### bib — 生成 BibTeX 引用
 
@@ -78,9 +70,9 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID> --source s2|openal
 
 ## 重要规则
 
-### tex 优先，fetch 备选
+### 获取全文只用 tex
 
-获取论文全文时**必须优先用 tex**。tex 拿到原生 LaTeX 源码，格式完整；fetch 依赖 PDF 转文本，复杂排版容易丢信息或错位。仅当 tex 失败（如论文未提供源文件）时才用 fetch。
+`tex` 命令会自动处理 fallback：先尝试下载 LaTeX 源文件（格式完整），失败时自动 fallback 到 PDF 下载并提取文本。无需手动选择。
 
 ### 有 tex 就不用 bib
 
@@ -90,7 +82,7 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID> --source s2|openal
 
 - **arXiv API**（info、bib 依赖）限流严格。连续调用多个依赖 arXiv API 的命令时，每次间隔至少 5 秒。不要在 search 后立刻跑 info/bib。
 - **Semantic Scholar**（search、cited 依赖）有 key 时 1 req/s，脚本设了 2s 间隔。连续查多篇 cited 时注意间隔。
-- **fetch 和 tex** 直接下载文件，不走 arXiv API，限流较宽松。
+- **tex** 直接下载文件，不走 arXiv API，限流较宽松。
 
 ### 常用 arXiv 分类
 

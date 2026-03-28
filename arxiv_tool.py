@@ -14,21 +14,19 @@ arXiv 论文搜索与全文获取工具
 
 功能：
 1. search - 搜索论文（关键词、标题、摘要）
-2. fetch - 获取论文全文（PDF 和 txt 都保留）
-3. info - 获取论文信息（标题、作者、摘要等，不下载）
-4. bib - 生成 BibTeX 引用（自动生成 citation key）
-5. tex - 下载 LaTeX 源文件并解压
-6. cited - 被引反查（Semantic Scholar 首选，OpenAlex 备选）
+2. info - 获取论文信息（标题、作者、摘要等，不下载）
+3. bib - 生成 BibTeX 引用（自动生成 citation key）
+4. tex - 下载 LaTeX 源文件并解压（失败时自动 fallback 到 PDF 下载）
+5. cited - 被引反查（Semantic Scholar 首选，OpenAlex 备选）
 
 使用方法（通过 uv run）：
-    uv run /home/prime/Codes/Docs/arxiv_tool.py search "PINN" --max 5
-    uv run /home/prime/Codes/Docs/arxiv_tool.py fetch 2401.12345
-    uv run /home/prime/Codes/Docs/arxiv_tool.py info 2401.12345
-    uv run /home/prime/Codes/Docs/arxiv_tool.py bib 2401.12345 -o refs.bib
-    uv run /home/prime/Codes/Docs/arxiv_tool.py tex 2401.12345
-    uv run /home/prime/Codes/Docs/arxiv_tool.py cited 1711.10561 --max 20
-    uv run /home/prime/Codes/Docs/arxiv_tool.py cited 1711.10561 --offset 20  # 翻页
-    uv run /home/prime/Codes/Docs/arxiv_tool.py cited 1711.10561 --source openalex
+    uv run arxiv_tool.py search "PINN" --max 5
+    uv run arxiv_tool.py info 2401.12345
+    uv run arxiv_tool.py bib 2401.12345 -o refs.bib
+    uv run arxiv_tool.py tex 2401.12345
+    uv run arxiv_tool.py cited 1711.10561 --max 20
+    uv run arxiv_tool.py cited 1711.10561 --offset 20  # 翻页
+    uv run arxiv_tool.py cited 1711.10561 --source openalex
 """
 
 from __future__ import annotations
@@ -318,11 +316,11 @@ def cmd_search(args):
     _print_search_results(normalized)
 
 
-def cmd_fetch(args):
-    output_dir = Path(args.output) if args.output else OUTPUT_DIR
+def _fetch_pdf_fallback(arxiv_id: str, output_dir: Path) -> None:
+    """tex 失败后的备选：下载 PDF 并提取文本"""
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    clean_id = extract_arxiv_id(args.arxiv_id)
+    clean_id = extract_arxiv_id(arxiv_id)
     file_id = clean_id.replace("/", "_")
     txt_file = output_dir / f"{file_id}.txt"
     pdf_file = output_dir / f"{file_id}.pdf"
@@ -661,10 +659,9 @@ def _try_rename_with_title(
 
 
 def _s2_headers() -> dict[str, str]:
-    headers = {**HTTP_HEADERS}
     if S2_API_KEY:
-        headers["x-api-key"] = S2_API_KEY
-    return headers
+        return {**HTTP_HEADERS, "x-api-key": S2_API_KEY}
+    return HTTP_HEADERS
 
 
 def _search_s2(query: str, max_results: int = 10) -> list[dict] | None:
@@ -780,12 +777,11 @@ def _fetch_citations_s2(
 
 
 def _openalex_params(**extra) -> dict[str, str]:
-    params = {**extra}
     if OPENALEX_API_KEY:
-        params["api_key"] = OPENALEX_API_KEY
+        extra["api_key"] = OPENALEX_API_KEY
     else:
-        params["mailto"] = CONTACT_EMAIL
-    return params
+        extra["mailto"] = CONTACT_EMAIL
+    return extra
 
 
 def _resolve_openalex_id(arxiv_id: str) -> tuple[str, str, int] | None:
@@ -930,7 +926,8 @@ def cmd_tex(args):
         for line in tree_lines:
             print(line)
     else:
-        sys.exit(1)
+        print("\ntex 下载失败，fallback 到 PDF 下载...", file=sys.stderr)
+        _fetch_pdf_fallback(args.arxiv_id, output_dir)
 
 
 def main():
@@ -940,12 +937,11 @@ def main():
         epilog="""\
 示例:
     %(prog)s search "PINN" --max 5
-    %(prog)s fetch 2401.12345
-    %(prog)s fetch 2401.12345 --output ./papers
     %(prog)s info 2401.12345
     %(prog)s bib 2505.08783
     %(prog)s bib 2505.08783 -o references.bib
     %(prog)s tex 2505.08783
+    %(prog)s tex 2505.08783 --output ./papers
     %(prog)s cited 1711.10561
     %(prog)s cited 1711.10561 --max 50
     %(prog)s cited 1711.10561 --offset 20          # 第 21-40 条
@@ -968,12 +964,6 @@ def main():
         help="数据源: auto=自动(S2→OpenAlex→arXiv), s2, openalex, arxiv (默认 auto)",
     )
     search_parser.set_defaults(func=cmd_search)
-
-    # fetch 子命令
-    fetch_parser = subparsers.add_parser("fetch", help="获取论文全文并保存为 txt")
-    fetch_parser.add_argument("arxiv_id", help="arXiv ID")
-    fetch_parser.add_argument("--output", "-o", help=f"输出目录 (默认 {OUTPUT_DIR})")
-    fetch_parser.set_defaults(func=cmd_fetch)
 
     # info 子命令
     info_parser = subparsers.add_parser("info", help="获取论文信息（不下载全文）")
