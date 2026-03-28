@@ -136,7 +136,7 @@ class RateLimiter:
         cls._write(lock)
 
 
-def get_paper_info(arxiv_id: str) -> Result | CachedPaper | None:
+def get_paper_info(arxiv_id: str) -> CachedPaper | None:
     clean_id = extract_arxiv_id(arxiv_id)
 
     cached = get_cached_paper(clean_id)
@@ -164,7 +164,7 @@ def get_paper_info(arxiv_id: str) -> Result | CachedPaper | None:
     )
     bibtex = generate_bibtex(paper, clean_id)
     cache_paper(clean_id, cached_paper, bibtex)
-    return paper
+    return cached_paper
 
 
 def sanitize_filename(name: str, max_length: int = 80) -> str:
@@ -480,12 +480,14 @@ def generate_bibtex(paper: Result, arxiv_id: str) -> str:
 def cmd_bib(args):
     clean_id = extract_arxiv_id(args.arxiv_id)
 
-    # 确保缓存中有数据
+    # get_paper_info 会在首次获取时缓存 bibtex
     paper = get_paper_info(clean_id)
     if not paper:
         sys.exit(1)
 
-    bibtex = get_cached_bibtex(clean_id) or generate_bibtex(paper, clean_id)
+    bibtex = get_cached_bibtex(clean_id)
+    if not bibtex:
+        bibtex = generate_bibtex(paper, clean_id)
 
     if args.output:
         output_path = Path(args.output)
