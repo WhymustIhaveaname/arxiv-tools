@@ -1,0 +1,9 @@
+{
+  "name": "arxiv-tools",
+  "version": "1.0.0",
+  "description": "arXiv paper search and analysis tool — search, fetch, cite, and analyze academic papers from arXiv",
+  "author": { "name": "WhymustIhaveaname" },
+  "license": "MIT",
+  "skills": "./skills/",
+  "agents": "./agents/"
+}

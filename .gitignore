@@ -1,0 +1,7 @@
+.env
+.venv/
+/arxiv/
+*.pyc
+__pycache__/
+.ratelimit.lock
+.pytest_cache/
