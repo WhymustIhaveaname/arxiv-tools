@@ -76,6 +76,36 @@ HTTP_HEADERS = {
 
 OUTPUT_DIR = SCRIPT_DIR / "arxiv"
 
+_RETRYABLE_STATUS_CODES = (429, 500, 502, 503, 504)
+_MIN_PDF_BYTES = 10_240  # 10 KB — 小于此值大概率是错误页面而非 PDF
+
+
+def _request_with_retry(method, url, *, retries: int = 2, **kwargs) -> requests.Response:
+    """带指数退避重试的 HTTP 请求，处理 429/5xx 错误"""
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            resp = method(url, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code in _RETRYABLE_STATUS_CODES and attempt < retries:
+                wait = 1.5 * (attempt + 1)
+                print(f"HTTP {e.response.status_code}，{wait:.1f}s 后重试...", file=sys.stderr)
+                time.sleep(wait)
+                last_err = e
+                continue
+            raise
+        except requests.ConnectionError as e:
+            if attempt < retries:
+                wait = 1.5 * (attempt + 1)
+                print(f"连接错��，{wait:.1f}s 后重试...", file=sys.stderr)
+                time.sleep(wait)
+                last_err = e
+                continue
+            raise
+    raise last_err  # type: ignore[misc]
+
 
 class RateLimiter:
     """跨进程 rate limit 管理，用 json5 lock 文件实现"""
@@ -298,16 +328,46 @@ def _print_search_results(results: list[dict]) -> None:
         print()
 
 
+def _s2_filters_from_args(args) -> dict:
+    """从 CLI args 提取 S2 过滤参数"""
+    filters = {}
+    if getattr(args, "year", None):
+        filters["year"] = args.year
+    if getattr(args, "fields_of_study", None):
+        filters["fields_of_study"] = args.fields_of_study
+    if getattr(args, "pub_types", None):
+        filters["publication_types"] = args.pub_types
+    if getattr(args, "min_citations", None) is not None:
+        filters["min_citations"] = args.min_citations
+    if getattr(args, "venue", None):
+        filters["venue"] = args.venue
+    if getattr(args, "open_access", False):
+        filters["open_access"] = True
+    return filters
+
+
 def cmd_search(args):
     source = args.source
+    filters = _s2_filters_from_args(args)
 
     results = None
 
     if source in ("s2", "auto"):
-        print("搜索 Semantic Scholar...", file=sys.stderr)
-        raw = _search_s2(args.query, args.max)
-        if raw:
-            results = ("Semantic Scholar", _normalize_s2_search(raw))
+        if getattr(args, "bulk", False):
+            print("搜索 Semantic Scholar (bulk)...", file=sys.stderr)
+            sort = getattr(args, "sort", None)
+            token = getattr(args, "token", None)
+            ret = _search_s2_bulk(args.query, args.max, token=token, sort=sort, **filters)
+            if ret:
+                raw, next_token = ret
+                results = ("Semantic Scholar (bulk)", _normalize_s2_search(raw))
+                if next_token:
+                    print(f"\n下一页 token: {next_token}", file=sys.stderr)
+        else:
+            print("搜索 Semantic Scholar...", file=sys.stderr)
+            raw = _search_s2(args.query, args.max, **filters)
+            if raw:
+                results = ("Semantic Scholar", _normalize_s2_search(raw))
 
     if not results and source in ("openalex", "auto"):
         print("搜索 OpenAlex...", file=sys.stderr)
@@ -351,8 +411,10 @@ def _fetch_pdf_fallback(arxiv_id: str, output_dir: Path) -> None:
 
     pdf_url = f"https://arxiv.org/pdf/{clean_id}"
     print(f"下载 PDF: {pdf_url}")
-    response = requests.get(pdf_url, headers=HTTP_HEADERS, timeout=60)
-    response.raise_for_status()
+    response = _request_with_retry(requests.get, pdf_url, headers=HTTP_HEADERS, timeout=60)
+    if len(response.content) < _MIN_PDF_BYTES:
+        print(f"下载的文件仅 {len(response.content)} 字节，可能不是有效 PDF", file=sys.stderr)
+        return
     pdf_file.write_bytes(response.content)
 
     try:
@@ -556,8 +618,7 @@ def fetch_tex_source(arxiv_id: str, output_dir: Path) -> Path | None:
     print(f"下载源文件: {source_url}")
 
     try:
-        response = requests.get(source_url, headers=HTTP_HEADERS, timeout=60)
-        response.raise_for_status()
+        response = _request_with_retry(requests.get, source_url, headers=HTTP_HEADERS, timeout=60)
     except requests.RequestException as e:
         print(f"下载失败: {e}", file=sys.stderr)
         return None
@@ -687,7 +748,39 @@ def _s2_headers() -> dict[str, str]:
     return HTTP_HEADERS
 
 
-def _search_s2(query: str, max_results: int = 10) -> list[dict] | None:
+def _s2_search_params(
+    query: str,
+    max_results: int,
+    *,
+    year: str | None = None,
+    fields_of_study: str | None = None,
+    publication_types: str | None = None,
+    min_citations: int | None = None,
+    venue: str | None = None,
+    open_access: bool = False,
+) -> dict:
+    """构造 S2 搜索参数（search 和 bulk 共用）"""
+    params: dict = {
+        "query": query,
+        "limit": min(max_results, 100),
+        "fields": "title,year,authors,externalIds,citationCount,abstract",
+    }
+    if year:
+        params["year"] = year
+    if fields_of_study:
+        params["fieldsOfStudy"] = fields_of_study
+    if publication_types:
+        params["publicationTypes"] = publication_types
+    if min_citations is not None:
+        params["minCitationCount"] = str(min_citations)
+    if venue:
+        params["venue"] = venue
+    if open_access:
+        params["openAccessPdf"] = ""
+    return params
+
+
+def _search_s2(query: str, max_results: int = 10, **filters) -> list[dict] | None:
     """通过 Semantic Scholar 搜索论文
 
     Returns:
@@ -695,28 +788,61 @@ def _search_s2(query: str, max_results: int = 10) -> list[dict] | None:
         失败返回 None
     """
     RateLimiter.wait("s2")
-    url = f"{S2_API_BASE}/paper/search"
+    params = _s2_search_params(query, max_results, **filters)
     try:
-        resp = requests.get(
-            url,
-            params={
-                "query": query,
-                "limit": min(max_results, 100),
-                "fields": "title,year,authors,externalIds,citationCount,abstract",
-            },
+        resp = _request_with_retry(
+            requests.get,
+            f"{S2_API_BASE}/paper/search",
+            params=params,
             headers=_s2_headers(),
             timeout=30,
         )
         RateLimiter.record("s2")
-        resp.raise_for_status()
         data = resp.json()
     except requests.RequestException as e:
-        print(f"Semantic Scholar 搜索失败: {e}", file=sys.stderr)
+        print(f"Semantic Scholar 搜���失败: {e}", file=sys.stderr)
         return None
 
     if not data.get("data"):
         return None
     return data["data"][:max_results]
+
+
+def _search_s2_bulk(
+    query: str,
+    max_results: int = 100,
+    token: str | None = None,
+    sort: str | None = None,
+    **filters,
+) -> tuple[list[dict], str | None] | None:
+    """通过 Semantic Scholar bulk 搜索（token 分页，最多 1000 条）
+
+    Returns:
+        (论文列表, next_token)，失败返回 None
+    """
+    RateLimiter.wait("s2")
+    params = _s2_search_params(query, min(max_results, 1000), **filters)
+    if token:
+        params["token"] = token
+    if sort:
+        params["sort"] = sort
+    try:
+        resp = _request_with_retry(
+            requests.get,
+            f"{S2_API_BASE}/paper/search/bulk",
+            params=params,
+            headers=_s2_headers(),
+            timeout=30,
+        )
+        RateLimiter.record("s2")
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"Semantic Scholar bulk 搜索失败: {e}", file=sys.stderr)
+        return None
+
+    if not data.get("data"):
+        return None
+    return data["data"][:max_results], data.get("token")
 
 
 def _search_openalex(query: str, max_results: int = 10) -> list[dict] | None:
@@ -728,7 +854,8 @@ def _search_openalex(query: str, max_results: int = 10) -> list[dict] | None:
     """
     url = f"{OPENALEX_API_BASE}/works"
     try:
-        resp = requests.get(
+        resp = _request_with_retry(
+            requests.get,
             url,
             params=_openalex_params(
                 search=query,
@@ -738,7 +865,6 @@ def _search_openalex(query: str, max_results: int = 10) -> list[dict] | None:
             ),
             timeout=30,
         )
-        resp.raise_for_status()
         data = resp.json()
     except requests.RequestException as e:
         print(f"OpenAlex 搜索失败: {e}", file=sys.stderr)
@@ -760,13 +886,13 @@ def _fetch_citations_s2(
     RateLimiter.wait("s2")
     info_url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}"
     try:
-        resp = requests.get(
+        resp = _request_with_retry(
+            requests.get,
             info_url,
             params={"fields": "title,citationCount"},
             headers=_s2_headers(),
             timeout=30,
         )
-        resp.raise_for_status()
         paper_info = resp.json()
         print(f"论文: {paper_info['title']}")
         print(f"总被引次数: {paper_info['citationCount']}")
@@ -777,7 +903,8 @@ def _fetch_citations_s2(
     RateLimiter.wait("s2")
     citations_url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}/citations"
     try:
-        resp = requests.get(
+        resp = _request_with_retry(
+            requests.get,
             citations_url,
             params={
                 "fields": "title,year,externalIds,citationCount,authors",
@@ -787,7 +914,6 @@ def _fetch_citations_s2(
             headers=_s2_headers(),
             timeout=30,
         )
-        resp.raise_for_status()
         data = resp.json()
     except requests.RequestException as e:
         print(f"Semantic Scholar 引用列表获取失败: {e}", file=sys.stderr)
@@ -816,8 +942,7 @@ def _resolve_openalex_id(arxiv_id: str) -> tuple[str, str, int] | None:
     doi = f"10.48550/arXiv.{arxiv_id}"
     url = f"{OPENALEX_API_BASE}/works/doi:{doi}"
     try:
-        resp = requests.get(url, params=_openalex_params(), timeout=15)
-        resp.raise_for_status()
+        resp = _request_with_retry(requests.get, url, params=_openalex_params(), timeout=15)
         data = resp.json()
         openalex_id = data["id"].split("/")[-1]  # "https://openalex.org/W123" -> "W123"
         return openalex_id, data["title"], data["cited_by_count"]
@@ -848,7 +973,8 @@ def _fetch_citations_openalex(
 
     url = f"{OPENALEX_API_BASE}/works"
     try:
-        resp = requests.get(
+        resp = _request_with_retry(
+            requests.get,
             url,
             params=_openalex_params(
                 filter=f"cites:{work_id}",
@@ -859,7 +985,6 @@ def _fetch_citations_openalex(
             ),
             timeout=30,
         )
-        resp.raise_for_status()
         data = resp.json()
     except requests.RequestException as e:
         print(f"OpenAlex 引用列表获取失败: {e}", file=sys.stderr)
@@ -986,6 +1111,17 @@ def main():
         default="auto",
         help="数据源: auto=自动(S2→OpenAlex→arXiv), s2, openalex, arxiv (默认 auto)",
     )
+    # S2 过滤参数
+    search_parser.add_argument("--year", help="年份或范围 (如 2024, 2020-2024, 2020-)")
+    search_parser.add_argument("--fields-of-study", help="研究领域，逗号分隔 (如 Computer Science,Physics)")
+    search_parser.add_argument("--pub-types", help="发表类型，逗号分隔 (如 JournalArticle,Conference)")
+    search_parser.add_argument("--min-citations", type=int, help="最低引用数")
+    search_parser.add_argument("--venue", help="会议/期刊名称")
+    search_parser.add_argument("--open-access", action="store_true", help="仅显示开放获取论文")
+    # S2 bulk 搜索
+    search_parser.add_argument("--bulk", action="store_true", help="使用 S2 bulk 搜索（最多 1000 条）")
+    search_parser.add_argument("--sort", help="排序字段 (如 citationCount:desc, publicationDate:desc)")
+    search_parser.add_argument("--token", help="bulk 搜索翻页 token")
     search_parser.set_defaults(func=cmd_search)
 
     # info 子命令
