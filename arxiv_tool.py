@@ -74,7 +74,8 @@ HTTP_HEADERS = {
     "User-Agent": f"arxiv-tool/1.0{_mailto}",
 }
 
-OUTPUT_DIR = SCRIPT_DIR / "arxiv"
+CACHE_DIR = SCRIPT_DIR / ".arxiv"
+OUTPUT_DIR = CACHE_DIR
 
 _RETRYABLE_STATUS_CODES = (429, 500, 502, 503, 504)
 _MIN_PDF_BYTES = 10_240  # 10 KB — 小于此值大概率是错误页面而非 PDF

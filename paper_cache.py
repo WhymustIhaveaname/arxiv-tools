@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / ".paper_cache.db"
+CACHE_DIR = Path(__file__).parent / ".arxiv"
+DB_PATH = CACHE_DIR / "paper_cache.db"
 
 _CREATE_TABLE_SQL = """\
 CREATE TABLE IF NOT EXISTS papers (
@@ -42,6 +43,7 @@ class CachedPaper:
 
 
 def _get_conn() -> sqlite3.Connection:
+    CACHE_DIR.mkdir(exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute(_CREATE_TABLE_SQL)
     return conn
