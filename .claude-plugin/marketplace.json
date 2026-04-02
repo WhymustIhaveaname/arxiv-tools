@@ -1,0 +1,13 @@
+{
+  "name": "arxiv-tools",
+  "owner": {
+    "name": "WhymustIhaveaname"
+  },
+  "plugins": [
+    {
+      "name": "arxiv-tools",
+      "source": "./",
+      "description": "Search papers across multiple sources, download full text (LaTeX/PDF), generate BibTeX entries, and look up who cited a paper."
+    }
+  ]
+}
