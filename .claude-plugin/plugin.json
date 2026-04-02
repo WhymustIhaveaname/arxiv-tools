@@ -1,9 +1,8 @@
 {
   "name": "arxiv-tools",
-  "version": "1.0.0",
-  "description": "arXiv paper search and analysis tool — search, fetch, cite, and analyze academic papers from arXiv",
+  "version": "1.1.0",
+  "description": "Search papers across multiple sources, download full text (LaTeX/PDF), generate BibTeX entries, and look up who cited a paper.",
   "author": { "name": "WhymustIhaveaname" },
   "license": "MIT",
-  "skills": "./skills/",
-  "agents": "./agents/"
+  "skills": "./skills/"
 }

@@ -56,7 +56,12 @@ if TYPE_CHECKING:
     from arxiv import Result
 
 SCRIPT_DIR = Path(__file__).parent
-load_dotenv(SCRIPT_DIR / ".env", override=False)
+# 缓存目录：优先读 ARXIV_CACHE_DIR 环境变量，默认在脚本同目录下 .arxiv/
+CACHE_DIR = Path(os.environ.get("ARXIV_CACHE_DIR", SCRIPT_DIR / ".arxiv"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# 从缓存目录加载 .env，这样共享缓存的用户自动共享 API key
+load_dotenv(CACHE_DIR / ".env", override=False)
 
 # API Keys（有就用，没有也不影响基本功能）
 S2_API_KEY: str | None = os.environ.get("S2_API_KEY")
@@ -73,9 +78,6 @@ HTTP_HEADERS = {
     "User-Agent": f"arxiv-tool/1.0{_mailto}",
 }
 
-# 缓存目录：优先读 ARXIV_CACHE_DIR 环境变量，默认在脚本同目录下 .arxiv/
-CACHE_DIR = Path(os.environ.get("ARXIV_CACHE_DIR", SCRIPT_DIR / ".arxiv"))
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR = CACHE_DIR
 
 _RETRYABLE_STATUS_CODES = (429, 500, 502, 503, 504)
@@ -1091,8 +1093,7 @@ def cmd_cited(args):
 
 
 def cmd_tex(args):
-    output_dir = Path(args.output) if args.output else OUTPUT_DIR
-    result = fetch_tex_source(args.arxiv_id, output_dir)
+    result = fetch_tex_source(args.arxiv_id, OUTPUT_DIR)
     if result:
         print("\nDirectory structure:")
         print(result.name)
@@ -1101,7 +1102,7 @@ def cmd_tex(args):
             print(line)
     else:
         print("\ntex download failed, falling back to PDF...", file=sys.stderr)
-        _fetch_pdf_fallback(args.arxiv_id, output_dir)
+        _fetch_pdf_fallback(args.arxiv_id, OUTPUT_DIR)
 
 
 def main():
@@ -1115,7 +1116,6 @@ def main():
     %(prog)s bib 2505.08783
     %(prog)s bib 2505.08783 -o references.bib
     %(prog)s tex 2505.08783
-    %(prog)s tex 2505.08783 --output ./papers
     %(prog)s cited 1711.10561
     %(prog)s cited 1711.10561 --max 50
     %(prog)s cited 1711.10561 --offset 20          # 第 21-40 条
@@ -1181,7 +1181,6 @@ def main():
     # tex 子命令
     tex_parser = subparsers.add_parser("tex", help="下载 LaTeX 源文件并解压")
     tex_parser.add_argument("arxiv_id", help="arXiv ID")
-    tex_parser.add_argument("--output", "-o", help=f"输出目录 (默认 {OUTPUT_DIR})")
     tex_parser.set_defaults(func=cmd_tex)
 
     args = parser.parse_args()
