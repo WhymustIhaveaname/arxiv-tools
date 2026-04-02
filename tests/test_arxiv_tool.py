@@ -631,8 +631,8 @@ class TestCmdInfo:
 
         out = capsys.readouterr().out
         # 不应输出任何论文字段
-        assert "标题" not in out
-        assert "作者" not in out
+        assert "Title" not in out
+        assert "Authors" not in out
         assert "arXiv ID" not in out
 
 
@@ -660,7 +660,7 @@ class TestCmdBib:
         content = bib_file.read_text()
         assert "@misc{vaswani2017attention," in content
         assert content.endswith("\n")
-        assert "写入" in capsys.readouterr().out
+        assert "Written" in capsys.readouterr().out
 
     def test_append_to_existing_file(self, tmp_path, capsys):
         """追加到已有文件，前后有正确分隔"""
@@ -678,7 +678,7 @@ class TestCmdBib:
         assert "@misc{vaswani2017attention," in content
         # 追加前有 \n\n 分隔
         assert "\n\n@misc{vaswani2017attention," in content
-        assert "追加" in capsys.readouterr().out
+        assert "Appended" in capsys.readouterr().out
 
     def test_append_to_empty_file(self, tmp_path, capsys):
         """追加到空文件（size=0），不应多加分隔符"""
@@ -711,7 +711,7 @@ class TestFetchPdfFallbackCached:
         arxiv_tool._fetch_pdf_fallback(TEST_ID, tmp_path)
 
         out = capsys.readouterr().out
-        assert "文件已存在" in out
+        assert "Already exists" in out
         assert txt.read_text() == "cached"
 
 
@@ -730,7 +730,7 @@ class TestCmdTex:
             arxiv_tool.cmd_tex(args)
 
         out = capsys.readouterr().out
-        assert "目录结构" in out
+        assert "Directory structure" in out
         assert "main.tex" in out
         assert "ref.bib" in out
 
@@ -790,7 +790,7 @@ class TestCmdCited:
             mock_oa.assert_called_once()
 
         out = capsys.readouterr().out
-        assert "失败" in out  # "Semantic Scholar 失败，切换到 OpenAlex"
+        assert "failed" in out  # "Semantic Scholar failed, switching to OpenAlex"
         assert "OpenAlex" in out
         assert "Fallback Paper" in out
 
@@ -813,7 +813,7 @@ class TestCmdCited:
             arxiv_tool.cmd_cited(self._make_args(source="auto"))
 
         out = capsys.readouterr().out
-        assert "未找到引用" in out
+        assert "No citations found" in out
 
     def test_offset_passed_through(self):
         """offset 参数正确传递"""
@@ -836,7 +836,7 @@ class TestCmdSearch:
             arxiv_tool.cmd_search(args)
 
         out = capsys.readouterr().out
-        assert "未返回结果" in out
+        assert "No results" in out
 
     def test_arxiv_fallback_formats_output(self, capsys):
         """arXiv fallback 时输出包含标题/作者/日期"""
@@ -877,7 +877,7 @@ class TestPrintSearchResults:
         assert "arXiv:2401.00001" in out
         assert "Test" in out
         assert "Alice" in out
-        assert "被引: 10" in out
+        assert "Cited: 10" in out
         assert "Some abstract." in out
 
     def test_cited_by_none_omitted(self, capsys):
@@ -887,7 +887,7 @@ class TestPrintSearchResults:
         }]
         arxiv_tool._print_search_results(results)
         out = capsys.readouterr().out
-        assert "被引" not in out
+        assert "Cited" not in out
 
     def test_abstract_none_omitted(self, capsys):
         results = [{
@@ -896,7 +896,7 @@ class TestPrintSearchResults:
         }]
         arxiv_tool._print_search_results(results)
         out = capsys.readouterr().out
-        assert "摘要" not in out
+        assert "Abstract" not in out
 
     def test_abstract_newlines_replaced(self, capsys):
         results = [{
@@ -924,7 +924,7 @@ class TestPrintCitationsS2:
         assert "Paper A" in out
         assert "Alice, Bob" in out
         assert "arXiv:2401.00001" in out
-        assert "被引: 10" in out
+        assert "Cited: 10" in out
 
     def test_no_arxiv_id(self, capsys):
         results = [{
@@ -978,7 +978,7 @@ class TestPrintCitationsOpenAlex:
         out = capsys.readouterr().out
         assert "Paper X" in out
         assert "Alice" in out
-        assert "被引: 7" in out
+        assert "Cited: 7" in out
 
     def test_year_none(self, capsys):
         results = [{
@@ -1129,7 +1129,7 @@ class TestFetchPdfFallbackIntegration:
 
         arxiv_tool._fetch_pdf_fallback(TEST_ID, tmp_path)
         assert txt.read_text() == "cached"
-        assert "文件已存在" in capsys.readouterr().out
+        assert "Already exists" in capsys.readouterr().out
 
 
 @network

@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-CACHE_DIR = Path(__file__).parent / ".arxiv"
+import os
+
+CACHE_DIR = Path(os.environ.get("ARXIV_CACHE_DIR", Path(__file__).parent / ".arxiv"))
 DB_PATH = CACHE_DIR / "paper_cache.db"
 
 _CREATE_TABLE_SQL = """\

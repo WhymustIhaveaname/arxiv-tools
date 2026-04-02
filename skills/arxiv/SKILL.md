@@ -1,27 +1,18 @@
 ---
 name: arxiv
-description: |
-  arXiv 论文搜索与分析。当用户提到 arXiv ID（如 2401.12345）、需要搜索学术论文、
-  获取论文全文/摘要、生成 BibTeX 引用、查看被引论文时使用。
-allowed-tools:
-  - Bash
-  - Read
-  - Write
-  - Grep
-  - Glob
+description: >
+  This skill should be used when the user asks to "search for papers",
+  "get paper info", "download LaTeX source", "generate BibTeX citation",
+  "find citing papers", or provides an arXiv ID or arXiv URL.
 ---
 
 # arXiv 论文搜索与分析
 
-根据用户输入 `$ARGUMENTS` 判断需要执行哪个子命令。如果用户只给了关键词没说具体要干嘛，默认执行 search。如果用户给了 arXiv ID 没说具体要干嘛，默认执行 info。
+Five subcommands available: search (find papers), info (metadata), tex (download full text), bib (BibTeX), cited (reverse citation lookup). When user provides only keywords, default to search. When user provides only an arXiv ID, default to info.
 
 ## 运行方式
 
-使用插件目录下的 venv 运行：
-
-```bash
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" <子命令>
-```
+脚本依赖声明在文件头部的 inline metadata 中，请你自行负责依赖安装。
 
 ## 子命令
 
@@ -33,6 +24,25 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" <子命令>
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "关键词"
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "关键词" --max 10
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "关键词" --source s2|openalex|arxiv
+```
+
+S2 专用过滤参数：
+
+```bash
+--year 2024                    # 单年
+--year 2020-2024               # 年份范围
+--fields-of-study "Computer Science,Physics"
+--pub-types "JournalArticle,Conference"
+--min-citations 50
+--venue "NeurIPS"
+--open-access                  # 仅开放获取
+```
+
+S2 bulk 搜索（最多 1000 条，支持排序和翻页）：
+
+```bash
+--bulk --sort "citationCount:desc"
+--bulk --token <上次返回的 token>   # 翻页
 ```
 
 ### info — 获取论文信息（不下载）
@@ -83,15 +93,3 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID> --source s2|openal
 - **arXiv API**（info、bib 依赖）限流严格。连续调用多个依赖 arXiv API 的命令时，每次间隔至少 5 秒。不要在 search 后立刻跑 info/bib。
 - **Semantic Scholar**（search、cited 依赖）有 key 时 1 req/s，脚本设了 2s 间隔。连续查多篇 cited 时注意间隔。
 - **tex** 直接下载文件，不走 arXiv API，限流较宽松。
-
-### 常用 arXiv 分类
-
-| 分类 | 领域 |
-|------|------|
-| cs.AI | 人工智能 |
-| cs.LG | 机器学习 |
-| cs.CV | 计算机视觉 |
-| cs.CL | 计算语言学/NLP |
-| physics.comp-ph | 计算物理 |
-| math.NA | 数值分析 |
-| stat.ML | 统计机器学习 |
