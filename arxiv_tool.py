@@ -171,6 +171,42 @@ class RateLimiter:
             )
 
     @classmethod
+    def acquire(cls, service: str) -> None:
+        """原子地等待限流窗口并记录请求时间。
+
+        与 wait()+record() 不同，此方法在检查和写入期间持有排他文件锁，
+        防止并行进程同时通过限流检查。
+        """
+        interval = cls.INTERVALS[service]
+        for _ in range(5):
+            with open(cls.LOCK_FILE, "a+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                f.seek(0)
+                content = f.read()
+                try:
+                    lock = json5.loads(content) if content.strip() else {}
+                except ValueError:
+                    lock = {}
+
+                remaining = 0.0
+                if service in lock:
+                    remaining = interval - (time.time() - lock[service])
+
+                if remaining <= 0:
+                    lock[service] = time.time()
+                    f.seek(0)
+                    f.truncate()
+                    f.write(json5.dumps(lock))
+                    f.flush()
+                    os.fsync(f.fileno())
+                    return
+            # 锁已释放，等待剩余时间后重试
+            time.sleep(remaining)
+        raise RuntimeError(
+            f"RateLimiter: {service} failed to acquire request window after 5 attempts"
+        )
+
+    @classmethod
     def record(cls, service: str) -> None:
         lock = cls._read()
         lock[service] = time.time()
@@ -184,11 +220,21 @@ def get_paper_info(arxiv_id: str) -> CachedPaper | None:
     if cached:
         return cached
 
-    RateLimiter.wait("arxiv")
-    RateLimiter.record("arxiv")
     client = arxiv.Client()
     search = arxiv.Search(id_list=[clean_id])
-    results = list(client.results(search))
+    results = None
+    for attempt in range(3):
+        RateLimiter.acquire("arxiv")
+        try:
+            results = list(client.results(search))
+            break
+        except arxiv.HTTPError:
+            if attempt < 2:
+                wait = 3.0 * (attempt + 1)
+                print(f"arXiv 429, {wait:.0f}s后重试...", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            raise
     if not results:
         print(f"Paper not found: {clean_id}", file=sys.stderr)
         return None
@@ -815,7 +861,7 @@ def _search_s2(query: str, max_results: int = 10, **filters) -> list[dict] | Non
         论文列表 [{"title", "year", "authors", "externalIds", "citationCount", "abstract"}]，
         失败返回 None
     """
-    RateLimiter.wait("s2")
+    RateLimiter.acquire("s2")
     params = _s2_search_params(query, max_results, **filters)
     try:
         resp = _request_with_retry(
@@ -825,7 +871,6 @@ def _search_s2(query: str, max_results: int = 10, **filters) -> list[dict] | Non
             headers=_s2_headers(),
             timeout=30,
         )
-        RateLimiter.record("s2")
         data = resp.json()
     except requests.RequestException as e:
         print(f"Semantic Scholar search failed: {_brief_error(e)}", file=sys.stderr)
@@ -848,7 +893,7 @@ def _search_s2_bulk(
     Returns:
         (论文列表, next_token)，失败返回 None
     """
-    RateLimiter.wait("s2")
+    RateLimiter.acquire("s2")
     params = _s2_search_params(query, min(max_results, 1000), **filters)
     if token:
         params["token"] = token
@@ -862,7 +907,6 @@ def _search_s2_bulk(
             headers=_s2_headers(),
             timeout=30,
         )
-        RateLimiter.record("s2")
         data = resp.json()
     except requests.RequestException as e:
         print(f"Semantic Scholar bulk search failed: {_brief_error(e)}", file=sys.stderr)
@@ -911,7 +955,7 @@ def _fetch_citations_s2(
     Returns:
         (引用论文列表, 总被引次数)，失败返回 None
     """
-    RateLimiter.wait("s2")
+    RateLimiter.acquire("s2")
     info_url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}"
     try:
         resp = _request_with_retry(
@@ -928,7 +972,7 @@ def _fetch_citations_s2(
         print(f"Semantic Scholar query failed: {_brief_error(e)}", file=sys.stderr)
         return None
 
-    RateLimiter.wait("s2")
+    RateLimiter.acquire("s2")
     citations_url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}/citations"
     try:
         resp = _request_with_retry(
@@ -1184,7 +1228,17 @@ def main():
     tex_parser.set_defaults(func=cmd_tex)
 
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except arxiv.HTTPError as e:
+        # arxiv.HTTPError.__str__ 带完整 URL，只取 HTTP 状态码
+        print(f"Error: arXiv HTTP {e.status}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
