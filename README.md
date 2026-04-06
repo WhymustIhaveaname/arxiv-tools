@@ -35,7 +35,11 @@ Q&A:
 /plugin install arxiv-tools
 ```
 
-### 2. 共享缓存目录
+### 2. 更新插件
+
+`claude plugin update arxiv-tools@arxiv-tools`，或在 `/plugin` 交互界面中更新
+
+### 3. 共享缓存目录
 
 默认缓存在脚本同目录下的 `.arxiv/`，各用户独立。要共享缓存，所有用户设同一个环境变量指向同一个目录：
 
@@ -50,5 +54,5 @@ export ARXIV_CACHE_DIR="/shared/arxiv-cache"
 
 - **本地是不是有一个 sql 数据库协调用的?** 是，`paper_cache.py` 用 SQLite，数据库文件在 `.arxiv/paper_cache.db`。`papers` 表存论文元数据（标题、作者、摘要、日期、分类、PDF URL）和 BibTeX，用 `arxiv_id` 做主键。`get_paper_info()` 先查缓存，命中就不再调 arXiv API。
 - **tex 会存在哪里? 怎么检查这个 tex 有没有下载过的?** tex 源文件解压到 `.arxiv/{id}` 或 `.arxiv/{id}_{标题}` 目录。下载前检查：先精确匹配 `{id}` 目录是否存在，再 glob 匹配 `{id}_*` 是否有已重命名的目录，命中任一则直接返回已有路径，不重复下载。
-- **arxiv, S2 和 OpenAlex 的 ratelimit 是怎么实现的? 如果还是被 limit 了, 会输出什么?** `RateLimiter` 类用 `.ratelimit.lock`（json5 格式 + `fcntl` 文件锁）记录每个服务的上次请求时间，跨进程生效。间隔：arxiv 3.0s，S2 2.0s；OpenAlex 没有本地限流。如果服务端仍返回 429，`_request_with_retry` 做指数退避重试（最多 2 次），输出 `"HTTP 429，{wait}s 后重试..."`（stderr）。如果 `RateLimiter.wait()` 连续 5 次拿不到窗口，抛 `RuntimeError`。
+- **arxiv, S2 和 OpenAlex 的 ratelimit 是怎么实现的? 如果还是被 limit 了, 会输出什么?** `RateLimiter` 类用 `.ratelimit.lock`（json5 格式 + `fcntl` 文件锁）记录每个服务的上次请求时间，跨进程生效。间隔：arxiv 5.0s，S2 2.0s，OpenAlex 0.1s。所有限流和重试参数统一在 `RateLimiter` 中管理：`RETRIES=3`，指数退避 = `interval * 2^attempt`（如 arxiv: 5→10→20s，S2: 2→4→8s）。429/5xx 时输出 `"HTTP 429, {wait}s后重试..."`（stderr）。
 

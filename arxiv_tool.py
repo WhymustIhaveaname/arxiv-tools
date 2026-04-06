@@ -91,91 +91,66 @@ def _brief_error(e: requests.RequestException) -> str:
     return type(e).__name__
 
 
-def _request_with_retry(method, url, *, retries: int = 2, **kwargs) -> requests.Response:
-    """带指数退避重试的 HTTP 请求，处理 429/5xx 错误"""
-    last_err = None
-    for attempt in range(retries + 1):
+def _request_with_retry(method, url, *, service: str, **kwargs) -> requests.Response:
+    """带限流和指数退避重试的 HTTP 请求
+
+    自动调用 RateLimiter.acquire() 限流，429/5xx 时按 backoff() 指数退避。
+    """
+    last_err: requests.RequestException | None = None
+    for attempt in range(RateLimiter.RETRIES + 1):
+        RateLimiter.acquire(service)
         try:
             resp = method(url, **kwargs)
             resp.raise_for_status()
             return resp
         except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code in _RETRYABLE_STATUS_CODES and attempt < retries:
-                wait = 1.5 * (attempt + 1)
-                print(f"HTTP {e.response.status_code}, retrying in {wait:.1f}s...", file=sys.stderr)
-                time.sleep(wait)
-                last_err = e
-                continue
-            raise
+            retryable = (
+                e.response is not None
+                and e.response.status_code in _RETRYABLE_STATUS_CODES
+            )
+            if not retryable or attempt >= RateLimiter.RETRIES:
+                raise
+            msg = f"HTTP {e.response.status_code}"  # type: ignore[union-attr]
+            last_err = e
         except requests.ConnectionError as e:
-            if attempt < retries:
-                wait = 1.5 * (attempt + 1)
-                print(f"Connection error, retrying in {wait:.1f}s...", file=sys.stderr)
-                time.sleep(wait)
-                last_err = e
-                continue
-            raise
+            if attempt >= RateLimiter.RETRIES:
+                raise
+            msg = "Connection error"
+            last_err = e
+        wait = RateLimiter.backoff(service, attempt)
+        print(f"{msg}, {wait:.0f}s后重试...", file=sys.stderr)
+        time.sleep(wait)
     raise last_err  # type: ignore[misc]
 
 
 class RateLimiter:
-    """跨进程 rate limit 管理，用 json5 lock 文件实现"""
+    """跨进程 rate limit 管理，用 json5 lock 文件实现
+
+    所有限流和重试参数统一在此管理：
+    - INTERVALS: 各服务最小请求间隔（秒）
+    - RETRIES: 最大重试次数
+    - backoff(): 指数退避 = INTERVALS[service] * 2^attempt
+    """
 
     LOCK_FILE = CACHE_DIR / ".ratelimit.lock"
+    RETRIES = 3
     INTERVALS = {
         "s2": 2.0,  # Semantic Scholar: 1 req/s，用 2s 间隔留余量
-        "arxiv": 3.0,  # arXiv 官方 API，限流严格
+        "arxiv": 5.0,  # arXiv 官方 API，限流严格
+        "openalex": 0.1,  # OpenAlex 宽松
         "ut": 0.3,  # 测试用
     }
 
     @classmethod
-    def _read(cls) -> dict:
-        if not cls.LOCK_FILE.exists():
-            return {}
-        # try-catch approved: lock 文件可能损坏，自动删除并恢复，不应阻断功能
-        try:
-            return json5.loads(cls.LOCK_FILE.read_text())
-        except ValueError:
-            cls.LOCK_FILE.unlink(missing_ok=True)
-            return {}
-
-    @classmethod
-    def _write(cls, lock: dict) -> None:
-        with open(cls.LOCK_FILE, "w") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            f.write(json5.dumps(lock))
-            f.flush()
-            os.fsync(f.fileno())
-
-    @classmethod
-    def available(cls, service: str) -> bool:
-        lock = cls._read()
-        if service not in lock:
-            return True
-        return time.time() - lock[service] >= cls.INTERVALS[service]
-
-    @classmethod
-    def wait(cls, service: str) -> None:
-        interval = cls.INTERVALS[service]
-        for _ in range(5):
-            lock = cls._read()
-            if service not in lock:
-                break
-            remaining = interval - (time.time() - lock[service])
-            if remaining <= 0:
-                break
-            time.sleep(remaining)
-        else:
-            raise RuntimeError(
-                f"RateLimiter: {service} failed to acquire request window after 5 attempts"
-            )
+    def backoff(cls, service: str, attempt: int) -> float:
+        """指数退避秒数: interval * 2^attempt"""
+        return cls.INTERVALS[service] * (2 ** attempt)
 
     @classmethod
     def acquire(cls, service: str) -> None:
         """原子地等待限流窗口并记录请求时间。
 
-        与 wait()+record() 不同，此方法在检查和写入期间持有排他文件锁，
-        防止并行进程同时通过限流检查。
+        在检查和写入期间持有排他文件锁，防止并行进程同时通过限流检查。
         """
         interval = cls.INTERVALS[service]
         for _ in range(5):
@@ -206,12 +181,6 @@ class RateLimiter:
             f"RateLimiter: {service} failed to acquire request window after 5 attempts"
         )
 
-    @classmethod
-    def record(cls, service: str) -> None:
-        lock = cls._read()
-        lock[service] = time.time()
-        cls._write(lock)
-
 
 def get_paper_info(arxiv_id: str) -> CachedPaper | None:
     clean_id = extract_arxiv_id(arxiv_id)
@@ -220,17 +189,17 @@ def get_paper_info(arxiv_id: str) -> CachedPaper | None:
     if cached:
         return cached
 
-    client = arxiv.Client()
+    client = arxiv.Client(num_retries=0)
     search = arxiv.Search(id_list=[clean_id])
     results = None
-    for attempt in range(3):
+    for attempt in range(RateLimiter.RETRIES + 1):
         RateLimiter.acquire("arxiv")
         try:
             results = list(client.results(search))
             break
         except arxiv.HTTPError:
-            if attempt < 2:
-                wait = 3.0 * (attempt + 1)
+            if attempt < RateLimiter.RETRIES:
+                wait = RateLimiter.backoff("arxiv", attempt)
                 print(f"arXiv 429, {wait:.0f}s后重试...", file=sys.stderr)
                 time.sleep(wait)
                 continue
@@ -485,7 +454,7 @@ def _fetch_pdf_fallback(arxiv_id: str, output_dir: Path) -> None:
 
     pdf_url = f"https://arxiv.org/pdf/{clean_id}"
     print(f"Downloading PDF: {pdf_url}")
-    response = _request_with_retry(requests.get, pdf_url, headers=HTTP_HEADERS, timeout=60)
+    response = _request_with_retry(requests.get, pdf_url, service="arxiv", headers=HTTP_HEADERS, timeout=60)
     if len(response.content) < _MIN_PDF_BYTES:
         print(f"Downloaded file only {len(response.content)} bytes, likely not a valid PDF", file=sys.stderr)
         return
@@ -692,7 +661,7 @@ def fetch_tex_source(arxiv_id: str, output_dir: Path) -> Path | None:
     print(f"Downloading source: {source_url}")
 
     try:
-        response = _request_with_retry(requests.get, source_url, headers=HTTP_HEADERS, timeout=60)
+        response = _request_with_retry(requests.get, source_url, service="arxiv", headers=HTTP_HEADERS, timeout=60)
     except requests.RequestException as e:
         print(f"Download failed: {e}", file=sys.stderr)
         return None
@@ -861,12 +830,12 @@ def _search_s2(query: str, max_results: int = 10, **filters) -> list[dict] | Non
         论文列表 [{"title", "year", "authors", "externalIds", "citationCount", "abstract"}]，
         失败返回 None
     """
-    RateLimiter.acquire("s2")
     params = _s2_search_params(query, max_results, **filters)
     try:
         resp = _request_with_retry(
             requests.get,
             f"{S2_API_BASE}/paper/search",
+            service="s2",
             params=params,
             headers=_s2_headers(),
             timeout=30,
@@ -893,7 +862,6 @@ def _search_s2_bulk(
     Returns:
         (论文列表, next_token)，失败返回 None
     """
-    RateLimiter.acquire("s2")
     params = _s2_search_params(query, min(max_results, 1000), **filters)
     if token:
         params["token"] = token
@@ -903,6 +871,7 @@ def _search_s2_bulk(
         resp = _request_with_retry(
             requests.get,
             f"{S2_API_BASE}/paper/search/bulk",
+            service="s2",
             params=params,
             headers=_s2_headers(),
             timeout=30,
@@ -929,6 +898,7 @@ def _search_openalex(query: str, max_results: int = 10) -> list[dict] | None:
         resp = _request_with_retry(
             requests.get,
             url,
+            service="openalex",
             params=_openalex_params(
                 search=query,
                 select="id,title,authorships,publication_year,cited_by_count,ids,abstract_inverted_index",
@@ -955,12 +925,12 @@ def _fetch_citations_s2(
     Returns:
         (引用论文列表, 总被引次数)，失败返回 None
     """
-    RateLimiter.acquire("s2")
     info_url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}"
     try:
         resp = _request_with_retry(
             requests.get,
             info_url,
+            service="s2",
             params={"fields": "title,citationCount"},
             headers=_s2_headers(),
             timeout=30,
@@ -972,12 +942,12 @@ def _fetch_citations_s2(
         print(f"Semantic Scholar query failed: {_brief_error(e)}", file=sys.stderr)
         return None
 
-    RateLimiter.acquire("s2")
     citations_url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}/citations"
     try:
         resp = _request_with_retry(
             requests.get,
             citations_url,
+            service="s2",
             params={
                 "fields": "title,year,externalIds,citationCount,authors",
                 "offset": offset,
@@ -1014,7 +984,7 @@ def _resolve_openalex_id(arxiv_id: str) -> tuple[str, str, int] | None:
     doi = f"10.48550/arXiv.{arxiv_id}"
     url = f"{OPENALEX_API_BASE}/works/doi:{doi}"
     try:
-        resp = _request_with_retry(requests.get, url, params=_openalex_params(), timeout=15)
+        resp = _request_with_retry(requests.get, url, service="openalex", params=_openalex_params(), timeout=15)
         data = resp.json()
         openalex_id = data["id"].split("/")[-1]  # "https://openalex.org/W123" -> "W123"
         return openalex_id, data["title"], data["cited_by_count"]
@@ -1048,6 +1018,7 @@ def _fetch_citations_openalex(
         resp = _request_with_retry(
             requests.get,
             url,
+            service="openalex",
             params=_openalex_params(
                 filter=f"cites:{work_id}",
                 select="id,title,authorships,publication_year,cited_by_count",

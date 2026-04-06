@@ -1015,58 +1015,43 @@ class TestRateLimiter:
         yield
         arxiv_tool.RateLimiter.LOCK_FILE.unlink(missing_ok=True)
 
-    def test_available_when_no_lock(self):
-        assert arxiv_tool.RateLimiter.available("ut") is True
-
-    def test_not_available_right_after_record(self):
-        arxiv_tool.RateLimiter.record("ut")
-        assert arxiv_tool.RateLimiter.available("ut") is False
-
-    def test_available_after_interval(self):
-        arxiv_tool.RateLimiter.record("ut")
-        time.sleep(0.35)
-        assert arxiv_tool.RateLimiter.available("ut") is True
-
-    def test_record_does_not_affect_other_services(self):
-        arxiv_tool.RateLimiter.record("ut")
-        assert arxiv_tool.RateLimiter.available("s2") is True
-
-    def test_wait_returns_immediately_when_available(self):
+    def test_acquire_returns_immediately_when_no_lock(self):
         start = time.time()
-        arxiv_tool.RateLimiter.wait("ut")
+        arxiv_tool.RateLimiter.acquire("ut")
         assert time.time() - start < 0.1
 
-    def test_wait_sleeps_remaining_time(self):
-        arxiv_tool.RateLimiter.record("ut")
-        time.sleep(0.1)  # 已过 0.1s，还需等 ~0.2s
+    def test_acquire_waits_for_interval(self):
+        """连续两次 acquire 应等待 interval"""
+        arxiv_tool.RateLimiter.acquire("ut")
         start = time.time()
-        arxiv_tool.RateLimiter.wait("ut")
+        arxiv_tool.RateLimiter.acquire("ut")
         elapsed = time.time() - start
-        assert 0.1 < elapsed < 0.4
+        assert elapsed >= 0.25  # interval=0.3s，允许少量时钟误差
 
-    def test_wait_retries_on_contention(self):
-        """模拟另一个进程在 wait 期间更新了时间戳，使 wait 必须重试多次"""
-        original_read = arxiv_tool.RateLimiter._read
-        call_count = 0
+    def test_acquire_does_not_block_other_services(self):
+        """acquire("ut") 不影响 acquire("openalex")"""
+        arxiv_tool.RateLimiter.acquire("ut")
+        start = time.time()
+        arxiv_tool.RateLimiter.acquire("openalex")
+        assert time.time() - start < 0.15  # openalex interval=0.1s
 
-        def _contended_read():
-            nonlocal call_count
-            call_count += 1
-            if call_count <= 2:
-                # 前两次读取都返回"刚刚记录"的时间戳，模拟另一个进程在争抢
-                return {"ut": time.time()}
-            return original_read()
+    def test_acquire_after_interval_elapsed(self):
+        """等待 interval 后第二次 acquire 应立即返回"""
+        arxiv_tool.RateLimiter.acquire("ut")
+        time.sleep(0.35)
+        start = time.time()
+        arxiv_tool.RateLimiter.acquire("ut")
+        assert time.time() - start < 0.1
 
-        arxiv_tool.RateLimiter.record("ut")
-        with patch.object(arxiv_tool.RateLimiter, "_read", side_effect=_contended_read):
-            arxiv_tool.RateLimiter.wait("ut")
-
-        assert call_count >= 3  # 确认至少重试了 3 次
+    def test_backoff_formula(self):
+        assert arxiv_tool.RateLimiter.backoff("ut", 0) == 0.3
+        assert arxiv_tool.RateLimiter.backoff("ut", 1) == 0.6
+        assert arxiv_tool.RateLimiter.backoff("ut", 2) == 1.2
 
     def test_corrupt_lock_file_auto_recovers(self):
+        """损坏的 lock 文件不阻断 acquire"""
         arxiv_tool.RateLimiter.LOCK_FILE.write_text("this is not json")
-        assert arxiv_tool.RateLimiter.available("ut") is True
-        assert not arxiv_tool.RateLimiter.LOCK_FILE.exists()
+        arxiv_tool.RateLimiter.acquire("ut")  # 不应抛异常
 
 
 # ════════════════════════════════════════════════════════════════════
