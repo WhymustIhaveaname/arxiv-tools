@@ -6,83 +6,83 @@ description: >
   "find citing papers", or provides an arXiv ID or arXiv URL.
 ---
 
-# arXiv 论文搜索与分析
+# arXiv Paper Search and Analysis
 
-Five subcommands available: search (find papers), info (metadata), tex (download full text), bib (BibTeX), cited (reverse citation lookup). When user provides only keywords, default to search. When user provides only an arXiv ID, default to info.
+Five subcommands available: search (find papers), info (metadata), tex (download full text), bib (BibTeX), cited (reverse citation lookup).
 
-## 运行方式
+## How to run
 
-脚本依赖声明在文件头部的 inline metadata 中，请你自行负责依赖安装。
+Script dependencies are declared in inline metadata at the top of the file — you are responsible for installing them yourself.
 
-## 子命令
+## Subcommands
 
-### search — 搜索论文
+### search — find papers
 
 ```bash
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "关键词"
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "关键词" --max 10
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "关键词" --source s2|openalex|arxiv
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "keywords"
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "keywords" --max 10
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "keywords" --source s2|openalex|arxiv
 ```
 
-S2 专用过滤参数：
+S2-specific filter parameters:
 
 ```bash
---year 2024                    # 单年
---year 2020-2024               # 年份范围
+--year 2024                    # single year
+--year 2020-2024               # year range
 --fields-of-study "Computer Science,Physics"
 --pub-types "JournalArticle,Conference"
 --min-citations 50
 --venue "NeurIPS"
---open-access                  # 仅开放获取
+--open-access                  # open-access only
 ```
 
-S2 bulk 搜索（最多 1000 条，支持排序和翻页）：
+S2 bulk search (up to 1000 results, supports sorting and pagination):
 
 ```bash
 --bulk --sort "citationCount:desc"
---bulk --token <上次返回的 token>   # 翻页
+--bulk --token <token from previous page>   # pagination
 ```
 
-### info — 获取论文信息（不下载 tex）
+### info — get paper metadata (does not download tex)
 
 ```bash
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info <arXiv ID>
 ```
 
-### tex — 下载论文全文
+### tex — download full paper source
 
 ```bash
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" tex <arXiv ID>
 ```
 
-下载 tex 源文件并返回下载目录和目录结构，保留完整 LaTeX 格式和图片。若源文件不可用，自动 fallback 到 PDF 下载并提取文本.
+Downloads the tex source and returns the directory path and structure, preserving full LaTeX formatting and figures. If the source is unavailable, falls back to PDF download and text extraction.
 
-### bib — 生成 BibTeX 引用
+### bib — generate BibTeX citation
 
 ```bash
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <arXiv ID>
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <arXiv ID> -o references.bib  # 追加到文件
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <arXiv ID> -o references.bib  # append to file
 ```
 
-### cited — 被引反查
+### cited — reverse citation lookup
 
-查看哪些论文引用了某篇论文。
+Find which papers cite a given paper.
 
 ```bash
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID>
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID> --max 50
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID> --offset 20         # 翻页
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID> --offset 20         # pagination
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID> --source s2|openalex
 ```
 
-## 数据源 fallback
+## Data source fallback
 
-| 子命令 | fallback 顺序 |
-|--------|--------------|
+| Subcommand | Fallback order |
+|------------|---------------|
 | search | S2 → OpenAlex → arXiv |
 | cited | S2 → OpenAlex |
-| info / bib | 本地缓存 → OpenAlex → S2 → arXiv |
-| tex | 本地缓存 → arXiv |
+| info / bib | local cache → OpenAlex → S2 → arXiv |
+| tex | local cache → arXiv |
 
-- search/cited 优先 S2：引用数据更全
-- info/bib 优先 OpenAlex：限流最宽松（0.1s/req vs S2 2s vs arXiv 5s）
+- search/cited prefer S2: more complete citation data
+- info/bib prefer OpenAlex: most lenient rate limit (0.1s/req vs S2 2s vs arXiv 5s)
