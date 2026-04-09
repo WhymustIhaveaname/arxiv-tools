@@ -42,18 +42,15 @@ import sys
 import tarfile
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
-
 import arxiv
 import fitz  # PyMuPDF
 import json5
 import requests
 from dotenv import load_dotenv
 
-from paper_cache import CachedAuthor, CachedPaper, cache_paper, get_cached_bibtex, get_cached_paper
+from datetime import datetime as _datetime
 
-if TYPE_CHECKING:
-    from arxiv import Result
+from paper_cache import CachedAuthor, CachedPaper, cache_paper, get_cached_bibtex, get_cached_paper
 
 SCRIPT_DIR = Path(__file__).parent
 # 缓存目录：优先读 ARXIV_CACHE_DIR 环境变量，默认在脚本同目录下 .arxiv/
@@ -182,15 +179,75 @@ class RateLimiter:
         )
 
 
-def get_paper_info(arxiv_id: str) -> CachedPaper | None:
-    clean_id = extract_arxiv_id(arxiv_id)
+def _fetch_paper_s2(arxiv_id: str) -> CachedPaper | None:
+    """Fetch paper metadata from Semantic Scholar"""
+    url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}"
+    try:
+        resp = _request_with_retry(
+            requests.get, url, service="s2",
+            params={"fields": "title,authors,abstract"},
+            headers=_s2_headers(),
+            timeout=15,
+        )
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"S2 lookup failed: {_brief_error(e)}", file=sys.stderr)
+        return None
 
-    cached = get_cached_paper(clean_id)
-    if cached:
-        return cached
+    if not data.get("title") or not data.get("authors"):
+        return None
 
+    published = _arxiv_date(arxiv_id)
+    if not published:
+        return None
+
+    return CachedPaper(
+        title=data["title"],
+        authors=[CachedAuthor(a["name"]) for a in data["authors"]],
+        abstract=data.get("abstract") or "",
+        pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
+    )
+
+
+def _fetch_paper_openalex(arxiv_id: str) -> CachedPaper | None:
+    """Fetch paper metadata from OpenAlex"""
+    doi = f"10.48550/arXiv.{arxiv_id}"
+    url = f"{OPENALEX_API_BASE}/works/doi:{doi}"
+    try:
+        resp = _request_with_retry(
+            requests.get, url, service="openalex",
+            params=_openalex_params(
+                select="title,authorships,abstract_inverted_index",
+            ),
+            timeout=15,
+        )
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"OpenAlex lookup failed: {_brief_error(e)}", file=sys.stderr)
+        return None
+
+    if not data.get("title"):
+        return None
+
+    authorships = data.get("authorships") or []
+    authors = [CachedAuthor(a["author"]["display_name"]) for a in authorships]
+    if not authors:
+        return None
+
+    abstract = _reconstruct_abstract(data.get("abstract_inverted_index")) or ""
+
+    return CachedPaper(
+        title=data["title"],
+        authors=authors,
+        abstract=abstract,
+        pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
+    )
+
+
+def _fetch_paper_arxiv(arxiv_id: str) -> CachedPaper | None:
+    """Fetch paper metadata from arXiv API (slowest, used as last resort)"""
     client = arxiv.Client(num_retries=0)
-    search = arxiv.Search(id_list=[clean_id])
+    search = arxiv.Search(id_list=[arxiv_id])
     results = None
     for attempt in range(RateLimiter.RETRIES + 1):
         RateLimiter.acquire("arxiv")
@@ -205,22 +262,38 @@ def get_paper_info(arxiv_id: str) -> CachedPaper | None:
                 continue
             raise
     if not results:
-        print(f"Paper not found: {clean_id}", file=sys.stderr)
         return None
 
     paper = results[0]
-    cached_paper = CachedPaper(
+    return CachedPaper(
         title=paper.title,
         authors=[CachedAuthor(a.name) for a in paper.authors],
-        summary=paper.summary,
-        published=paper.published,
-        updated=paper.updated,
+        abstract=paper.summary,
         categories=list(paper.categories),
         pdf_url=paper.pdf_url,
     )
+
+
+def get_paper_info(arxiv_id: str) -> CachedPaper | None:
+    clean_id = extract_arxiv_id(arxiv_id)
+
+    cached = get_cached_paper(clean_id)
+    if cached:
+        return cached
+
+    paper = (
+        _fetch_paper_openalex(clean_id)
+        or _fetch_paper_s2(clean_id)
+        or _fetch_paper_arxiv(clean_id)
+    )
+
+    if not paper:
+        print(f"Paper not found: {clean_id}", file=sys.stderr)
+        return None
+
     bibtex = generate_bibtex(paper, clean_id)
-    cache_paper(clean_id, cached_paper, bibtex)
-    return cached_paper
+    cache_paper(clean_id, paper, bibtex)
+    return paper
 
 
 def sanitize_filename(name: str, max_length: int = 80) -> str:
@@ -484,14 +557,17 @@ def cmd_info(args):
     if not paper:
         return
 
+    arxiv_date = _arxiv_date(clean_id)
+    date_str = arxiv_date.strftime("%Y-%m") if arxiv_date else "?"
+
     print(f"arXiv ID: {clean_id}")
     print(f"Title: {paper.title}")
     print(f"Authors: {', '.join(a.name for a in paper.authors)}")
-    print(f"Published: {paper.published.strftime('%Y-%m-%d')}")
-    print(f"Updated: {paper.updated.strftime('%Y-%m-%d')}")
-    print(f"Categories: {', '.join(paper.categories)}")
+    print(f"Published: {date_str}")
+    if paper.categories:
+        print(f"Categories: {', '.join(paper.categories)}")
     print(f"PDF: {paper.pdf_url}")
-    print(f"\nAbstract:\n{paper.summary}")
+    print(f"\nAbstract:\n{paper.abstract}")
 
 
 # 停用词列表，用于生成 citation key
@@ -545,14 +621,39 @@ STOPWORDS = {
 }
 
 
-def generate_citation_key(paper: Result) -> str:
+def _arxiv_year(arxiv_id: str) -> int | None:
+    """从 arXiv ID 提取提交年份（最权威的来源）
+
+    新格式 YYMM.XXXXX → 20YY；旧格式 subject/YYMMNNN → 19YY/20YY
+    """
+    d = _arxiv_date(arxiv_id)
+    return d.year if d else None
+
+
+def _arxiv_date(arxiv_id: str) -> _datetime | None:
+    """从 arXiv ID 提取提交年月 → YYYY-MM-01"""
+    m = re.match(r"(\d{2})(\d{2})\.\d+", arxiv_id)
+    if not m:
+        m = re.match(r"[a-z-]+/(\d{2})(\d{2})\d{3}", arxiv_id)
+    if not m:
+        return None
+    yy, mm = int(m.group(1)), int(m.group(2))
+    if not 1 <= mm <= 12:
+        return None
+    year = 1900 + yy if yy >= 91 else 2000 + yy
+    return _datetime(year, mm, 1)
+
+
+def generate_citation_key(paper, arxiv_id: str) -> str:
     """生成 BibTeX citation key
 
     格式：{第一作者姓小写}{年份}{标题首个实词小写}
     示例：li2025codepde, raissi2017physics
+
+    年份从 arXiv ID 提取，避免 OpenAlex 等返回期刊出版年。
     """
     last_name = re.sub(r"[^a-z]", "", paper.authors[0].name.split()[-1].lower())
-    year = paper.published.year
+    year = _arxiv_year(arxiv_id)
 
     title_words = re.findall(r"[a-zA-Z]+", paper.title)
     first_word = ""
@@ -564,22 +665,26 @@ def generate_citation_key(paper: Result) -> str:
     return f"{last_name}{year}{first_word}"
 
 
-def generate_bibtex(paper: Result, arxiv_id: str) -> str:
+def generate_bibtex(paper, arxiv_id: str) -> str:
     """生成 arXiv 标准格式的 BibTeX 条目"""
-    citation_key = generate_citation_key(paper)
+    citation_key = generate_citation_key(paper, arxiv_id)
     authors = " and ".join(a.name for a in paper.authors)
     clean_id = re.sub(r"v\d+$", "", arxiv_id)
+    year = _arxiv_year(arxiv_id) or paper.published.year
 
-    bibtex = f"""@misc{{{citation_key},
-      title={{{paper.title}}},
-      author={{{authors}}},
-      year={{{paper.published.year}}},
-      eprint={{{clean_id}}},
-      archivePrefix={{arXiv}},
-      primaryClass={{{paper.categories[0]}}},
-      url={{https://arxiv.org/abs/{clean_id}}},
-}}"""
-    return bibtex
+    fields = [
+        f"title={{{paper.title}}}",
+        f"author={{{authors}}}",
+        f"year={{{year}}}",
+        f"eprint={{{clean_id}}}",
+        "archivePrefix={arXiv}",
+    ]
+    if paper.categories:
+        fields.append(f"primaryClass={{{paper.categories[0]}}}")
+    fields.append(f"url={{https://arxiv.org/abs/{clean_id}}}")
+
+    body = ",\n      ".join(fields)
+    return f"@misc{{{citation_key},\n      {body},\n}}"
 
 
 def cmd_bib(args):

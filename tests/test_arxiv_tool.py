@@ -44,17 +44,19 @@ class MockAuthor:
 
 @dataclass
 class MockPaper:
+    """Dual-purpose mock: acts as CachedPaper (for bib/info tests) and arxiv.Result
+    (for _normalize_arxiv_search test, which reads .summary and .published)"""
     title: str
     authors: list
-    published: datetime
-    updated: datetime = None
     categories: list = field(default_factory=list)
-    summary: str = "Mock abstract."
+    abstract: str = "Mock abstract."
     pdf_url: str = "https://arxiv.org/pdf/0000.00000"
+    published: datetime = None  # only for arxiv.Result-style tests
 
-    def __post_init__(self):
-        if self.updated is None:
-            self.updated = self.published
+    @property
+    def summary(self):
+        """Alias: arxiv.Result uses .summary, our CachedPaper uses .abstract"""
+        return self.abstract
 
 
 MOCK_PAPER = MockPaper(
@@ -64,9 +66,8 @@ MOCK_PAPER = MockPaper(
         MockAuthor("Noam Shazeer"),
         MockAuthor("Niki Parmar"),
     ],
-    published=datetime(2017, 6, 12),
     categories=["cs.CL", "cs.LG"],
-    summary="The dominant sequence transduction models are based on complex recurrent or convolutional neural networks...",
+    abstract="The dominant sequence transduction models are based on complex recurrent or convolutional neural networks...",
     pdf_url=f"https://arxiv.org/pdf/{TEST_ID}",
 )
 
@@ -135,37 +136,62 @@ class TestSanitizeFilename:
         assert result == "hello_world_foo"
 
 
+class TestArxivYear:
+    """arXiv ID 年份提取"""
+
+    def test_new_format(self):
+        assert arxiv_tool._arxiv_year("1706.03762") == 2017
+
+    def test_new_format_five_digit(self):
+        assert arxiv_tool._arxiv_year("2505.08783") == 2025
+
+    def test_old_format(self):
+        assert arxiv_tool._arxiv_year("cs/0401001") == 2004
+
+    def test_old_format_90s(self):
+        assert arxiv_tool._arxiv_year("hep-th/9108028") == 1991
+
+    def test_garbage_returns_none(self):
+        assert arxiv_tool._arxiv_year("not-an-id") is None
+
+
 class TestGenerateCitationKey:
     """BibTeX citation key 生成"""
 
     def test_attention_paper(self):
-        assert arxiv_tool.generate_citation_key(MOCK_PAPER) == TEST_CITATION_KEY
+        assert arxiv_tool.generate_citation_key(MOCK_PAPER, TEST_ID) == TEST_CITATION_KEY
+
+    def test_year_from_arxiv_id(self):
+        """年份从 arXiv ID 提取"""
+        paper = MockPaper(
+            title="Attention Is All You Need",
+            authors=[MockAuthor("Ashish Vaswani")],
+        )
+        key = arxiv_tool.generate_citation_key(paper, "1706.03762")
+        assert "2017" in key
 
     def test_skips_stopwords(self):
         paper = MockPaper(
             title="The Art of Programming",
             authors=[MockAuthor("Donald Knuth")],
-            published=datetime(1968, 1, 1),
         )
-        assert arxiv_tool.generate_citation_key(paper) == "knuth1968art"
+        assert arxiv_tool.generate_citation_key(paper, "2401.00001") == "knuth2024art"
 
     def test_all_stopword_title(self):
         """标题全是停用词时，first_word 为空"""
         paper = MockPaper(
             title="The Of And In",
             authors=[MockAuthor("Jane Doe")],
-            published=datetime(2024, 1, 1),
         )
-        key = arxiv_tool.generate_citation_key(paper)
+        key = arxiv_tool.generate_citation_key(paper, "2401.00001")
         assert key == "doe2024"
 
     def test_hyphenated_last_name(self):
         paper = MockPaper(
             title="Some Result",
             authors=[MockAuthor("Jean-Pierre Serre")],
-            published=datetime(2000, 1, 1),
         )
-        key = arxiv_tool.generate_citation_key(paper)
+        key = arxiv_tool.generate_citation_key(paper, "0001.00001")
         assert key.startswith("serre2000")
 
 
@@ -187,6 +213,18 @@ class TestGenerateBibtex:
         bib = arxiv_tool.generate_bibtex(MOCK_PAPER, "1706.03762v5")
         assert "eprint={1706.03762}" in bib
         assert "v5" not in bib
+
+    def test_omits_primary_class_when_no_categories(self):
+        """categories 为空时不输出 primaryClass"""
+        paper = MockPaper(
+            title="Test Paper",
+            authors=[MockAuthor("Alice Bob")],
+            categories=[],
+        )
+        bib = arxiv_tool.generate_bibtex(paper, "2401.00001")
+        assert "primaryClass" not in bib
+        assert "eprint={2401.00001}" in bib
+        assert "archivePrefix={arXiv}" in bib
 
 
 class TestPrintTree:
@@ -845,7 +883,7 @@ class TestCmdSearch:
             authors=[MockAuthor("Alice"), MockAuthor("Bob")],
             published=datetime(2024, 3, 15),
             categories=["cs.LG"],
-            summary="A short abstract.",
+            abstract="A short abstract.",
         )
         mock_paper.entry_id = "http://arxiv.org/abs/2401.00001v1"
 
@@ -1078,14 +1116,65 @@ class TestGetPaperInfo:
         first = paper_info.authors[0].name.lower()
         assert TEST_FIRST_AUTHOR_LAST in first
 
-    def test_year(self, paper_info):
-        assert paper_info.published.year == TEST_YEAR
-
     def test_categories(self, paper_info):
-        assert TEST_PRIMARY_CLASS in paper_info.categories
+        # 只有 arXiv 源提供 categories，fallback 到其他源时为空
+        if paper_info.categories:
+            assert TEST_PRIMARY_CLASS in paper_info.categories
 
     def test_not_found_returns_none(self):
         result = arxiv_tool.get_paper_info("9999.99999")
+        assert result is None
+
+
+@network
+class TestFetchPaperSources:
+    """三个数据源的独立测试 + 一致性验证"""
+
+    def test_openalex_returns_paper(self):
+        result = arxiv_tool._fetch_paper_openalex(TEST_ID)
+        assert result is not None
+        assert TEST_TITLE in result.title
+        assert TEST_FIRST_AUTHOR_LAST in result.authors[0].name.lower()
+
+    def test_s2_returns_paper(self):
+        result = arxiv_tool._fetch_paper_s2(TEST_ID)
+        assert result is not None
+        assert "attention" in result.title.lower()
+        assert TEST_FIRST_AUTHOR_LAST in result.authors[0].name.lower()
+
+    def test_arxiv_returns_paper(self):
+        result = arxiv_tool._fetch_paper_arxiv(TEST_ID)
+        assert result is not None
+        assert TEST_TITLE in result.title
+        assert result.categories  # 只有 arXiv 源有 categories
+
+    def test_sources_consistent(self):
+        """三个源返回的 title 和第一作者应一致"""
+        oa = arxiv_tool._fetch_paper_openalex(TEST_ID)
+        s2 = arxiv_tool._fetch_paper_s2(TEST_ID)
+        ar = arxiv_tool._fetch_paper_arxiv(TEST_ID)
+        assert oa and s2 and ar
+
+        # title 忽略大小写比较（S2 大小写可能不同）
+        assert oa.title.lower() == ar.title.lower()
+        assert s2.title.lower() == ar.title.lower()
+        # 第一作者一致
+        assert oa.authors[0].name == ar.authors[0].name
+        assert s2.authors[0].name == ar.authors[0].name
+
+    def test_bibtex_year_from_arxiv_id(self):
+        """无论哪个源，BibTeX year 都应从 arXiv ID 提取"""
+        oa = arxiv_tool._fetch_paper_openalex(TEST_ID)
+        assert oa is not None
+        bib = arxiv_tool.generate_bibtex(oa, TEST_ID)
+        assert "year={2017}" in bib  # 不是 OpenAlex 的 2025
+
+    def test_openalex_not_found_returns_none(self):
+        result = arxiv_tool._fetch_paper_openalex("9999.99999")
+        assert result is None
+
+    def test_s2_not_found_returns_none(self):
+        result = arxiv_tool._fetch_paper_s2("9999.99999")
         assert result is None
 
 

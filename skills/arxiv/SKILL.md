@@ -18,8 +18,6 @@ Five subcommands available: search (find papers), info (metadata), tex (download
 
 ### search — 搜索论文
 
-搜索默认走 Semantic Scholar → OpenAlex → arXiv 三级 fallback。
-
 ```bash
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "关键词"
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "关键词" --max 10
@@ -68,7 +66,7 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <arXiv ID> -o references.bib  #
 
 ### cited — 被引反查
 
-查看哪些论文引用了某篇论文（S2 首选，OpenAlex 备选）。
+查看哪些论文引用了某篇论文。
 
 ```bash
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID>
@@ -76,3 +74,15 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID> --max 50
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID> --offset 20         # 翻页
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID> --source s2|openalex
 ```
+
+## 数据源 fallback
+
+| 子命令 | fallback 顺序 |
+|--------|--------------|
+| search | S2 → OpenAlex → arXiv |
+| cited | S2 → OpenAlex |
+| info / bib | 本地缓存 → OpenAlex → S2 → arXiv |
+| tex | 本地缓存 → arXiv |
+
+- search/cited 优先 S2：引用数据更全
+- info/bib 优先 OpenAlex：限流最宽松（0.1s/req vs S2 2s vs arXiv 5s）
