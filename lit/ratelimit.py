@@ -38,6 +38,8 @@ class RateLimiter:
         # NCBI E-utilities: 3 req/s without an API key, 10 req/s with one.
         # 0.35s keeps us safely under the no-key limit; with a key we're still OK.
         "pubmed": 0.35,
+        # Crossref polite pool (with mailto) is ~50 req/s; 0.05s is a safe cap.
+        "crossref": 0.05,
         "ut": 0.3,
     }
 

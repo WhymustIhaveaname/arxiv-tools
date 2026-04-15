@@ -133,10 +133,16 @@ def _fetch_paper_s2(arxiv_id: str) -> CachedPaper | None:
     )
 
 
-def _fetch_citations_s2(
-    arxiv_id: str, max_results: int, offset: int = 0
+def _fetch_citations_s2_spec(
+    paper_spec: str, max_results: int, offset: int = 0
 ) -> tuple[list[dict], int] | None:
-    info_url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}"
+    """Fetch citations given a generic S2 paper_id spec.
+
+    paper_spec is whatever S2 accepts in the URL path, e.g. ``"ArXiv:2401.12345"``,
+    ``"PMID:39876543"``, ``"DOI:10.1038/xxx"``, ``"CorpusId:123"``. The caller is
+    responsible for building the correct prefix.
+    """
+    info_url = f"{S2_API_BASE}/paper/{paper_spec}"
     try:
         resp = _request_with_retry(
             requests.get,
@@ -153,7 +159,7 @@ def _fetch_citations_s2(
         print(f"Semantic Scholar query failed: {_brief_error(e)}", file=sys.stderr)
         return None
 
-    citations_url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}/citations"
+    citations_url = f"{S2_API_BASE}/paper/{paper_spec}/citations"
     try:
         resp = _request_with_retry(
             requests.get,
@@ -176,6 +182,13 @@ def _fetch_citations_s2(
         item["citingPaper"] for item in data["data"] if item["citingPaper"]["title"]
     ]
     return results[:max_results], paper_info["citationCount"]
+
+
+def _fetch_citations_s2(
+    arxiv_id: str, max_results: int, offset: int = 0
+) -> tuple[list[dict], int] | None:
+    """Back-compat wrapper for arXiv IDs — delegates to _fetch_citations_s2_spec."""
+    return _fetch_citations_s2_spec(f"ArXiv:{arxiv_id}", max_results, offset)
 
 
 def _normalize_s2_search(results: list[dict]) -> list[dict]:

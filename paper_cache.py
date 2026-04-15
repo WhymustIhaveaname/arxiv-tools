@@ -51,6 +51,7 @@ class CachedPaper:
     abstract: str = ""
     categories: list[str] = field(default_factory=list)
     pdf_url: str = ""
+    year: int | None = None
     source: str | None = None
     doi: str | None = None
     pmid: str | None = None

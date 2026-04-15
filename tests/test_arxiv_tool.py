@@ -1014,8 +1014,8 @@ class TestCmdCited:
             {"title": "Paper A", "authors": [{"name": "A"}], "externalIds": {"ArXiv": "2401.00001"}, "citationCount": 10, "year": 2024},
             {"title": "Paper B", "authors": [{"name": "B"}], "externalIds": {}, "citationCount": 5, "year": 2023},
         ]
-        with patch("arxiv_tool._fetch_citations_s2", return_value=(fake_results, 100)) as mock_s2, \
-             patch("arxiv_tool._fetch_citations_openalex") as mock_oa:
+        with patch("arxiv_tool._fetch_citations_s2_spec", return_value=(fake_results, 100)) as mock_s2, \
+             patch("arxiv_tool._fetch_citations_openalex_spec") as mock_oa:
             arxiv_tool.cmd_cited(self._make_args(source="s2"))
             mock_s2.assert_called_once()
             mock_oa.assert_not_called()
@@ -1027,8 +1027,8 @@ class TestCmdCited:
     def test_openalex_forced(self, capsys):
         """--source openalex 只调 OpenAlex"""
         fake_results = [{"title": "Paper X", "authorships": [], "cited_by_count": 10, "publication_year": 2020}]
-        with patch("arxiv_tool._fetch_citations_s2") as mock_s2, \
-             patch("arxiv_tool._fetch_citations_openalex", return_value=(fake_results, 50)) as mock_oa:
+        with patch("arxiv_tool._fetch_citations_s2_spec") as mock_s2, \
+             patch("arxiv_tool._fetch_citations_openalex_spec", return_value=(fake_results, 50)) as mock_oa:
             arxiv_tool.cmd_cited(self._make_args(source="openalex"))
             mock_s2.assert_not_called()
             mock_oa.assert_called_once()
@@ -1040,8 +1040,8 @@ class TestCmdCited:
     def test_auto_fallback_s2_to_openalex(self, capsys):
         """auto 模式: S2 失败后回退到 OpenAlex"""
         fake_results = [{"title": "Fallback Paper", "authorships": [], "cited_by_count": 5, "publication_year": 2021}]
-        with patch("arxiv_tool._fetch_citations_s2", return_value=None) as mock_s2, \
-             patch("arxiv_tool._fetch_citations_openalex", return_value=(fake_results, 30)) as mock_oa:
+        with patch("arxiv_tool._fetch_citations_s2_spec", return_value=None) as mock_s2, \
+             patch("arxiv_tool._fetch_citations_openalex_spec", return_value=(fake_results, 30)) as mock_oa:
             arxiv_tool.cmd_cited(self._make_args(source="auto"))
             mock_s2.assert_called_once()
             mock_oa.assert_called_once()
@@ -1054,8 +1054,8 @@ class TestCmdCited:
     def test_auto_s2_success_no_openalex(self, capsys):
         """auto 模式: S2 成功则不调 OpenAlex"""
         fake_results = [{"title": "S2 Paper", "authors": [{"name": "A"}], "externalIds": {}, "citationCount": 10, "year": 2020}]
-        with patch("arxiv_tool._fetch_citations_s2", return_value=(fake_results, 100)), \
-             patch("arxiv_tool._fetch_citations_openalex") as mock_oa:
+        with patch("arxiv_tool._fetch_citations_s2_spec", return_value=(fake_results, 100)), \
+             patch("arxiv_tool._fetch_citations_openalex_spec") as mock_oa:
             arxiv_tool.cmd_cited(self._make_args(source="auto"))
             mock_oa.assert_not_called()
 
@@ -1065,8 +1065,8 @@ class TestCmdCited:
 
     def test_both_fail(self, capsys):
         """两个数据源都失败"""
-        with patch("arxiv_tool._fetch_citations_s2", return_value=None), \
-             patch("arxiv_tool._fetch_citations_openalex", return_value=None):
+        with patch("arxiv_tool._fetch_citations_s2_spec", return_value=None), \
+             patch("arxiv_tool._fetch_citations_openalex_spec", return_value=None):
             arxiv_tool.cmd_cited(self._make_args(source="auto"))
 
         out = capsys.readouterr().out
@@ -1075,10 +1075,120 @@ class TestCmdCited:
     def test_offset_passed_through(self):
         """offset 参数正确传递"""
         fake_results = [{"title": "P", "authors": [], "externalIds": {}, "citationCount": 0, "year": 2020}]
-        with patch("arxiv_tool._fetch_citations_s2", return_value=(fake_results, 100)) as mock_s2:
+        with patch("arxiv_tool._fetch_citations_s2_spec", return_value=(fake_results, 100)) as mock_s2:
             arxiv_tool.cmd_cited(self._make_args(source="s2", offset=20))
-            # cmd_cited 调用: _fetch_citations_s2(clean_id, args.max, offset)
-            mock_s2.assert_called_once_with(TEST_ID, 5, 20)
+            # cmd_cited builds an ArXiv: paper_spec before calling the spec fetcher.
+            mock_s2.assert_called_once_with(f"ArXiv:{TEST_ID}", 5, 20)
+
+    def test_pmid_routes_to_s2_with_pmid_spec(self):
+        """PMID input → S2 paper_spec uses PMID: prefix"""
+        fake_results = [{"title": "P", "authors": [], "externalIds": {}, "citationCount": 0, "year": 2024}]
+        args = argparse.Namespace(arxiv_id="39876543", source="s2", max=5, offset=0)
+        with patch("arxiv_tool._fetch_citations_s2_spec", return_value=(fake_results, 50)) as mock_s2:
+            arxiv_tool.cmd_cited(args)
+            mock_s2.assert_called_once_with("PMID:39876543", 5, 0)
+
+    def test_pmid_falls_back_to_openalex_with_pmid_spec(self):
+        fake_results = [{"title": "P", "authorships": [], "cited_by_count": 0, "publication_year": 2024}]
+        args = argparse.Namespace(arxiv_id="39876543", source="auto", max=5, offset=0)
+        with patch("arxiv_tool._fetch_citations_s2_spec", return_value=None), \
+             patch("arxiv_tool._fetch_citations_openalex_spec", return_value=(fake_results, 30)) as mock_oa:
+            arxiv_tool.cmd_cited(args)
+            mock_oa.assert_called_once_with("PMID:39876543", 5, 0)
+
+    def test_unknown_id_exits_nonzero(self):
+        args = argparse.Namespace(arxiv_id="totally not an id", source="auto", max=5, offset=0)
+        with patch("arxiv_tool._fetch_citations_s2_spec") as mock_s2:
+            with pytest.raises(SystemExit):
+                arxiv_tool.cmd_cited(args)
+            mock_s2.assert_not_called()
+
+
+class TestCmdBibPubmed:
+    """cmd_bib routes PMIDs through Crossref → fallback."""
+
+    PUBMED_PAPER = CachedPaper(
+        title="X",
+        authors=[CachedAuthor("Author A")],
+        source="pubmed",
+        pmid="123",
+        doi="10.1038/foo",
+        year=2024,
+        categories=["Nature"],
+    )
+
+    def test_pmid_uses_crossref_when_doi_present(self, capsys):
+        with patch("arxiv_tool._fetch_paper_pubmed", return_value=self.PUBMED_PAPER), \
+             patch("arxiv_tool.fetch_bibtex_crossref", return_value="@article{cr,title={X}}") as mock_cr:
+            args = argparse.Namespace(arxiv_id="39876543", output=None)
+            arxiv_tool.cmd_bib(args)
+        mock_cr.assert_called_once_with("10.1038/foo")
+        assert "@article{cr" in capsys.readouterr().out
+
+    def test_pmid_falls_back_when_crossref_returns_none(self, capsys):
+        with patch("arxiv_tool._fetch_paper_pubmed", return_value=self.PUBMED_PAPER), \
+             patch("arxiv_tool.fetch_bibtex_crossref", return_value=None):
+            args = argparse.Namespace(arxiv_id="39876543", output=None)
+            arxiv_tool.cmd_bib(args)
+        out = capsys.readouterr().out
+        assert "@article{" in out
+        # _bib_for_pmid uses the PMID supplied on the command line, not paper.pmid.
+        assert "pmid={39876543}" in out
+        assert "journal={Nature}" in out
+        assert "year={2024}" in out
+
+    def test_pmid_skips_crossref_when_no_doi(self):
+        no_doi = CachedPaper(title="X", authors=[CachedAuthor("Author A")], pmid="123", year=2024)
+        with patch("arxiv_tool._fetch_paper_pubmed", return_value=no_doi), \
+             patch("arxiv_tool.fetch_bibtex_crossref") as mock_cr:
+            args = argparse.Namespace(arxiv_id="39876543", output=None)
+            arxiv_tool.cmd_bib(args)
+        mock_cr.assert_not_called()
+
+    def test_pmid_not_found_exits(self):
+        with patch("arxiv_tool._fetch_paper_pubmed", return_value=None):
+            args = argparse.Namespace(arxiv_id="39876543", output=None)
+            with pytest.raises(SystemExit):
+                arxiv_tool.cmd_bib(args)
+
+
+class TestGenerateBibtexPubmed:
+    """Local @article fallback structure."""
+
+    def test_includes_all_optional_fields(self):
+        paper = CachedPaper(
+            title="My Paper",
+            authors=[CachedAuthor("Jane Smith"), CachedAuthor("Bob Jones")],
+            year=2024,
+            categories=["Nature"],
+            doi="10.1038/foo",
+            pmcid="PMC1234",
+        )
+        bib = arxiv_tool.generate_bibtex_pubmed(paper, "39876543")
+        assert bib.startswith("@article{")
+        assert "title={My Paper}" in bib
+        assert "author={Jane Smith and Bob Jones}" in bib
+        assert "journal={Nature}" in bib
+        assert "year={2024}" in bib
+        assert "doi={10.1038/foo}" in bib
+        assert "pmid={39876543}" in bib
+        assert "pmcid={PMC1234}" in bib
+        assert "url={https://pubmed.ncbi.nlm.nih.gov/39876543/}" in bib
+
+    def test_minimal_paper_uses_pmid_fallback_key(self):
+        """No authors and no year → key falls back to pm{pmid}"""
+        paper = CachedPaper(title="X", authors=[])
+        bib = arxiv_tool.generate_bibtex_pubmed(paper, "999")
+        assert bib.startswith("@article{pm999,")
+
+    def test_citation_key_format(self):
+        paper = CachedPaper(
+            title="A Study of CRISPR",
+            authors=[CachedAuthor("Jane Smith")],
+            year=2024,
+        )
+        bib = arxiv_tool.generate_bibtex_pubmed(paper, "39876543")
+        assert bib.startswith("@article{smith2024study,")
 
 
 class TestCmdSearch:
@@ -1510,7 +1620,7 @@ class TestCitedSemanticScholar:
 
     def test_citations_and_max_results(self):
         """基本查询 + max_results 限制"""
-        ret = arxiv_tool._fetch_citations_s2(TEST_ID, max_results=3)
+        ret = arxiv_tool._fetch_citations_s2_spec(TEST_ID, max_results=3)
         assert ret is not None, "S2 返回 None（可能被限流）"
         results, total = ret
         assert total > 0
@@ -1520,12 +1630,12 @@ class TestCitedSemanticScholar:
 
     def test_offset(self):
         """offset 翻页返回不同结果"""
-        ret = arxiv_tool._fetch_citations_s2(TEST_ID, max_results=3, offset=0)
+        ret = arxiv_tool._fetch_citations_s2_spec(TEST_ID, max_results=3, offset=0)
         assert ret is not None, "S2 返回 None（可能被限流）"
         titles_page1 = {p.get("title") for p in ret[0]}
 
         time.sleep(1)
-        ret = arxiv_tool._fetch_citations_s2(TEST_ID, max_results=3, offset=5)
+        ret = arxiv_tool._fetch_citations_s2_spec(TEST_ID, max_results=3, offset=5)
         assert ret is not None, "S2 返回 None（可能被限流）"
         titles_page2 = {p.get("title") for p in ret[0]}
 
@@ -1545,7 +1655,7 @@ class TestCitedOpenAlex:
         assert cited_by > 0
 
     def test_returns_citations(self):
-        ret = arxiv_tool._fetch_citations_openalex(TEST_ID, max_results=5)
+        ret = arxiv_tool._fetch_citations_openalex_spec(TEST_ID, max_results=5)
         assert ret is not None
         results, total = ret
         assert total > 0
@@ -1554,7 +1664,7 @@ class TestCitedOpenAlex:
             assert work.get("title")
 
     def test_respects_max_results(self):
-        ret = arxiv_tool._fetch_citations_openalex(TEST_ID, max_results=3)
+        ret = arxiv_tool._fetch_citations_openalex_spec(TEST_ID, max_results=3)
         assert ret is not None
         results, _ = ret
         assert len(results) <= 3

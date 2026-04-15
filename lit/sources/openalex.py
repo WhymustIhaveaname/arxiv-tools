@@ -91,10 +91,22 @@ def _fetch_paper_openalex(arxiv_id: str) -> CachedPaper | None:
     )
 
 
-def _resolve_openalex_id(arxiv_id: str) -> tuple[str, str, int] | None:
-    """Resolve an arXiv ID to (openalex_work_id, title, cited_by_count)."""
-    doi = f"10.48550/arXiv.{arxiv_id}"
-    url = f"{OPENALEX_API_BASE}/works/doi:{doi}"
+def _resolve_openalex_id_spec(paper_spec: str) -> tuple[str, str, int] | None:
+    """Resolve a generic paper_spec to (openalex_work_id, title, cited_by_count).
+
+    Accepts ``"ArXiv:xxx"`` (mapped via 10.48550/arXiv.xxx DOI), ``"PMID:xxx"``
+    (OpenAlex's native pmid: accessor), or ``"DOI:xxx"``.
+    """
+    if paper_spec.startswith("ArXiv:"):
+        doi = f"10.48550/arXiv.{paper_spec[len('ArXiv:'):]}"
+        url = f"{OPENALEX_API_BASE}/works/doi:{doi}"
+    elif paper_spec.startswith("PMID:"):
+        url = f"{OPENALEX_API_BASE}/works/pmid:{paper_spec[len('PMID:'):]}"
+    elif paper_spec.startswith("DOI:"):
+        url = f"{OPENALEX_API_BASE}/works/doi:{paper_spec[len('DOI:'):]}"
+    else:
+        return None
+
     try:
         resp = _request_with_retry(requests.get, url, service="openalex", params=_openalex_params(), timeout=15)
         data = resp.json()
@@ -104,10 +116,15 @@ def _resolve_openalex_id(arxiv_id: str) -> tuple[str, str, int] | None:
         return None
 
 
-def _fetch_citations_openalex(
-    arxiv_id: str, max_results: int, offset: int = 0
+def _resolve_openalex_id(arxiv_id: str) -> tuple[str, str, int] | None:
+    """Back-compat wrapper for arXiv IDs."""
+    return _resolve_openalex_id_spec(f"ArXiv:{arxiv_id}")
+
+
+def _fetch_citations_openalex_spec(
+    paper_spec: str, max_results: int, offset: int = 0
 ) -> tuple[list[dict], int] | None:
-    resolved = _resolve_openalex_id(arxiv_id)
+    resolved = _resolve_openalex_id_spec(paper_spec)
     if not resolved:
         print("OpenAlex: paper not found", file=sys.stderr)
         return None
@@ -140,6 +157,13 @@ def _fetch_citations_openalex(
         return None
 
     return data["results"][:max_results], total_citations
+
+
+def _fetch_citations_openalex(
+    arxiv_id: str, max_results: int, offset: int = 0
+) -> tuple[list[dict], int] | None:
+    """Back-compat wrapper for arXiv IDs — delegates to _fetch_citations_openalex_spec."""
+    return _fetch_citations_openalex_spec(f"ArXiv:{arxiv_id}", max_results, offset)
 
 
 def _normalize_openalex_search(results: list[dict]) -> list[dict]:

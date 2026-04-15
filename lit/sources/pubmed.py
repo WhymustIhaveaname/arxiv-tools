@@ -9,6 +9,7 @@ Key is read from the PUBMED_API_KEY environment variable (see config.py).
 
 from __future__ import annotations
 
+import re
 import sys
 import xml.etree.ElementTree as ET
 
@@ -192,6 +193,17 @@ def _fetch_paper_pubmed(pmid: str) -> CachedPaper | None:
     journal = article.findtext(".//Article/Journal/Title") or ""
     categories = [journal] if journal else []
 
+    year: int | None = None
+    year_text = article.findtext(".//Article/Journal/JournalIssue/PubDate/Year")
+    if year_text and year_text.isdigit():
+        year = int(year_text)
+    else:
+        # MedlineDate covers e.g. "2024 Jan-Feb" or seasonal issues.
+        medline_date = article.findtext(".//Article/Journal/JournalIssue/PubDate/MedlineDate") or ""
+        m = re.search(r"\b(19|20)\d{2}\b", medline_date)
+        if m:
+            year = int(m.group(0))
+
     pdf_url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
     if pmcid:
         pdf_url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/"
@@ -202,6 +214,7 @@ def _fetch_paper_pubmed(pmid: str) -> CachedPaper | None:
         abstract=abstract,
         categories=categories,
         pdf_url=pdf_url,
+        year=year,
         source="pubmed",
         pmid=pmid,
         doi=doi or None,

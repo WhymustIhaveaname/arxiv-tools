@@ -58,7 +58,13 @@ from lit.ids import (
     extract_paper_id,
     sanitize_filename,
 )
-from lit.bibtex import STOPWORDS, generate_bibtex, generate_citation_key
+from lit.bibtex import (
+    STOPWORDS,
+    generate_bibtex,
+    generate_bibtex_pubmed,
+    generate_citation_key,
+)
+from lit.crossref import fetch_bibtex_crossref
 from lit.ratelimit import RateLimiter, _brief_error, _request_with_retry
 from lit.fulltext import (
     _extract_braced_arg,
@@ -82,16 +88,19 @@ from lit.sources.pubmed import (
 )
 from lit.sources.openalex import (
     _fetch_citations_openalex,
+    _fetch_citations_openalex_spec,
     _fetch_paper_openalex,
     _normalize_openalex_search,
     _openalex_params,
     _print_citations_openalex,
     _reconstruct_abstract,
     _resolve_openalex_id,
+    _resolve_openalex_id_spec,
     _search_openalex,
 )
 from lit.sources.s2 import (
     _fetch_citations_s2,
+    _fetch_citations_s2_spec,
     _fetch_paper_s2,
     _normalize_s2_search,
     _print_citations_s2,
@@ -255,8 +264,54 @@ def cmd_info(args):
     print(f"\nAbstract:\n{paper.abstract}")
 
 
+def _write_bibtex(bibtex: str, output: str | None) -> None:
+    if not output:
+        print(bibtex)
+        return
+    output_path = Path(output)
+    mode = "a" if output_path.exists() else "w"
+    with open(output_path, mode, encoding="utf-8") as f:
+        if mode == "a" and output_path.stat().st_size > 0:
+            f.write("\n\n")
+        f.write(bibtex)
+        f.write("\n")
+    print(f"{'Appended' if mode == 'a' else 'Written'} to: {output_path}")
+
+
+def _bib_for_pmid(pmid: str) -> str | None:
+    """Fetch PubMed metadata then try Crossref (via DOI) before falling back
+    to a locally-built @article entry.
+    """
+    paper = _fetch_paper_pubmed(pmid)
+    if not paper:
+        print(f"Paper not found: PMID:{pmid}", file=sys.stderr)
+        return None
+
+    if paper.doi:
+        crossref_bib = fetch_bibtex_crossref(paper.doi)
+        if crossref_bib:
+            return crossref_bib
+
+    return generate_bibtex_pubmed(paper, pmid)
+
+
 def cmd_bib(args):
-    clean_id = extract_arxiv_id(args.arxiv_id)
+    id_type, clean_id = extract_paper_id(args.arxiv_id)
+
+    if id_type == "pmid":
+        bibtex = _bib_for_pmid(clean_id)
+        if not bibtex:
+            sys.exit(1)
+        _write_bibtex(bibtex, args.output)
+        return
+
+    if id_type != "arxiv":
+        print(
+            f"Unrecognised identifier '{args.arxiv_id}' — currently `bib` supports "
+            f"arXiv IDs and PMIDs.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     paper = get_paper_info(clean_id)
     if not paper:
@@ -266,29 +321,33 @@ def cmd_bib(args):
     if not bibtex:
         bibtex = generate_bibtex(paper, clean_id)
 
-    if args.output:
-        output_path = Path(args.output)
-        mode = "a" if output_path.exists() else "w"
-        with open(output_path, mode, encoding="utf-8") as f:
-            if mode == "a" and output_path.stat().st_size > 0:
-                f.write("\n\n")
-            f.write(bibtex)
-            f.write("\n")
-        print(f"{'Appended' if mode == 'a' else 'Written'} to: {output_path}")
-    else:
-        print(bibtex)
+    _write_bibtex(bibtex, args.output)
 
 
 def cmd_cited(args):
-    clean_id = extract_arxiv_id(args.arxiv_id)
+    id_type, clean_id = extract_paper_id(args.arxiv_id)
+    if id_type == "arxiv":
+        paper_spec = f"ArXiv:{clean_id}"
+        display_id = f"arXiv:{clean_id}"
+    elif id_type == "pmid":
+        paper_spec = f"PMID:{clean_id}"
+        display_id = f"PMID:{clean_id}"
+    else:
+        print(
+            f"Unrecognised identifier '{args.arxiv_id}' — currently `cited` supports "
+            f"arXiv IDs and PMIDs.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     source = args.source
     offset = args.offset
     results = None
     used_source = ""
 
     if source in ("s2", "auto"):
-        print(f"Querying Semantic Scholar: ArXiv:{clean_id}")
-        ret = _fetch_citations_s2(clean_id, args.max, offset)
+        print(f"Querying Semantic Scholar: {paper_spec}")
+        ret = _fetch_citations_s2_spec(paper_spec, args.max, offset)
         if ret is not None:
             results, _total = ret
             used_source = "Semantic Scholar"
@@ -297,14 +356,14 @@ def cmd_cited(args):
         if source == "auto":
             print("\nSemantic Scholar failed, switching to OpenAlex...")
         else:
-            print(f"Querying OpenAlex: ArXiv:{clean_id}")
-        ret = _fetch_citations_openalex(clean_id, args.max, offset)
+            print(f"Querying OpenAlex: {paper_spec}")
+        ret = _fetch_citations_openalex_spec(paper_spec, args.max, offset)
         if ret is not None:
             results, _total = ret
             used_source = "OpenAlex"
 
     if not results:
-        print(f"\nNo citations found for arXiv:{clean_id}")
+        print(f"\nNo citations found for {display_id}")
         return
 
     start_num = offset + 1
@@ -376,7 +435,7 @@ def main():
     info_parser.set_defaults(func=cmd_info)
 
     bib_parser = subparsers.add_parser("bib", help="生成 BibTeX 引用")
-    bib_parser.add_argument("arxiv_id", help="arXiv ID")
+    bib_parser.add_argument("arxiv_id", help="arXiv ID 或 PubMed PMID")
     bib_parser.add_argument("--output", "-o", help="输出文件路径（追加写入）")
     bib_parser.set_defaults(func=cmd_bib)
 

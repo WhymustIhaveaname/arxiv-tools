@@ -80,8 +80,14 @@ LaTeX source is only available for arXiv papers. For non-arXiv papers (bioRxiv, 
 
 ```bash
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <arXiv ID>
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <arXiv ID> -o references.bib  # append to file
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <PMID>                        # PubMed
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <arXiv ID|PMID> -o refs.bib   # append to file
 ```
+
+For PMIDs the tool first asks Crossref via DOI content negotiation
+(authoritative `@article` with journal/volume/issue/pages); on failure or
+when the paper has no DOI, it builds a minimal `@article` from EFetch
+metadata.
 
 ### cited — reverse citation lookup
 
@@ -89,10 +95,14 @@ Find which papers cite a given paper.
 
 ```bash
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID>
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID> --max 50
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID> --offset 20         # pagination
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID> --source s2|openalex
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <PMID>                       # PubMed
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <ID> --max 50
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <ID> --offset 20             # pagination
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <ID> --source s2|openalex
 ```
+
+Both S2 and OpenAlex resolve PMIDs natively, so PMID-cited works the same
+way as arXiv-cited.
 
 ## Data source fallback
 
