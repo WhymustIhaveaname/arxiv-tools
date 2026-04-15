@@ -1,14 +1,24 @@
 ---
-name: arxiv
+name: literature
 description: >
-  This skill should be used when the user asks to "search for papers",
-  "get paper info", "download LaTeX source", "generate BibTeX citation",
-  "find citing papers", or provides an arXiv ID or arXiv URL.
+  Use this skill whenever the user needs to work with academic papers across
+  ANY field — computer science, AI/ML, physics, math, chemistry, biology,
+  biomedicine, medicine, materials science, etc. Triggers include: "search
+  for papers", "find papers on <topic>", "look up this paper", "get the
+  abstract/metadata", "who cited this", "generate BibTeX", "download the
+  paper", "download LaTeX source", or when the user provides any paper
+  identifier — arXiv ID (e.g. 2401.12345), DOI (10.xxxx/...), PMID (PubMed
+  numeric ID), PMC ID (PMC1234567), or a bioRxiv/medRxiv/ChemRxiv URL.
+  Also triggers on domain-specific terms like CRISPR, protein folding,
+  catalysis, MeSH terms, clinical trials, drug discovery, etc. when the
+  user is clearly doing literature work.
 ---
 
-# arXiv Paper Search and Analysis
+# Academic Literature Tool (cross-domain)
 
-Five subcommands available: search (find papers), info (metadata), tex (download full text), bib (BibTeX), cited (reverse citation lookup).
+Search, fetch metadata, generate citations, download full text, and look up citations across multiple scholarly databases: Semantic Scholar, OpenAlex, arXiv (and — under active development — PubMed, PubMed Central, bioRxiv, medRxiv, ChemRxiv, Europe PMC, Crossref).
+
+Five subcommands: `search`, `info`, `tex`, `bib`, `cited`.
 
 ## How to run
 
@@ -24,12 +34,14 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "keywords" --max 10
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "keywords" --source s2|openalex|arxiv
 ```
 
+Works across all fields — S2 and OpenAlex cover chemistry, biology, medicine, physics, etc.
+
 S2-specific filter parameters:
 
 ```bash
 --year 2024                    # single year
 --year 2020-2024               # year range
---fields-of-study "Computer Science,Physics"
+--fields-of-study "Computer Science,Physics,Biology,Chemistry,Medicine"
 --pub-types "JournalArticle,Conference"
 --min-citations 50
 --venue "NeurIPS"
@@ -49,6 +61,8 @@ S2 bulk search (up to 1000 results, supports sorting and pagination):
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info <arXiv ID>
 ```
 
+Currently accepts arXiv IDs. DOI / PMID / PMC ID support is being added.
+
 ### tex — download full paper source
 
 ```bash
@@ -56,6 +70,8 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" tex <arXiv ID>
 ```
 
 Downloads the tex source and returns the directory path and structure, preserving full LaTeX formatting and figures. If the source is unavailable, falls back to PDF download and text extraction.
+
+LaTeX source is only available for arXiv papers. For non-arXiv papers (bioRxiv, PubMed, etc.), a future `fulltext` subcommand will fetch PDF / JATS XML.
 
 ### bib — generate BibTeX citation
 
