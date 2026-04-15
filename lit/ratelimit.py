@@ -42,6 +42,10 @@ class RateLimiter:
         "crossref": 0.05,
         # Europe PMC: 10 req/s on REST endpoints.
         "europepmc": 0.1,
+        # Unpaywall: no strict limit published; 100ms is polite.
+        "unpaywall": 0.1,
+        # Generic OA mirror PDF download (random third-party hosts).
+        "oa_mirror": 0.5,
         "ut": 0.3,
     }
 

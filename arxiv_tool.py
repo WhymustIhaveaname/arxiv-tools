@@ -64,8 +64,14 @@ from lit.bibtex import (
     generate_bibtex_pubmed,
     generate_citation_key,
 )
+from lit.browser import (
+    browser_download_pdf,
+    browser_download_via_click,
+    is_playwright_available,
+)
 from lit.crossref import fetch_bibtex_crossref
 from lit.enrich import enrich_paper_ids
+from lit.oa_mirror import find_oa_pdf_urls, try_download_pdf
 from lit.sources.chemrxiv import (
     _fetch_paper_chemrxiv,
     _normalize_chemrxiv_search,
@@ -215,6 +221,52 @@ def _is_biomed_preprint_doi(doi: str) -> bool:
     be in Europe PMC but missing from OpenAlex's preprint index."""
     low = doi.lower()
     return low.startswith("10.1101/") or low.startswith("10.21203/")
+
+
+def _is_biorxiv_doi(doi: str) -> bool:
+    """bioRxiv & medRxiv share the 10.1101 prefix."""
+    return doi.lower().startswith("10.1101/")
+
+
+def _save_pdf_and_text(pdf_bytes: bytes, out_basename: str) -> None:
+    """Write ``{basename}.pdf`` + ``{basename}.txt`` to OUTPUT_DIR.
+
+    The .txt is PyMuPDF's text extraction — readable by the LLM directly.
+    Skips text if extraction fails; the raw PDF remains usable.
+    """
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    pdf_path = OUTPUT_DIR / f"{out_basename}.pdf"
+    txt_path = OUTPUT_DIR / f"{out_basename}.txt"
+    pdf_path.write_bytes(pdf_bytes)
+    print(f"Saved PDF: {pdf_path} ({len(pdf_bytes):,} bytes)")
+
+    text = _extract_pdf_text(pdf_bytes)
+    if text:
+        txt_path.write_text(
+            f"# {out_basename}\n\n## Full Text\n\n{text}", encoding="utf-8",
+        )
+        print(f"Saved text: {txt_path} ({len(text):,} chars)")
+    else:
+        print("PDF text extraction failed; raw PDF is still usable.", file=sys.stderr)
+
+
+def _try_oa_mirror_for_pdf(
+    *, doi: str | None = None, openalex_pdf_url: str | None = None,
+) -> bytes | None:
+    """Run the OA-mirror chain: Unpaywall → OpenAlex → Crossref TDM.
+
+    Returns the first valid PDF body found, or ``None`` if every mirror
+    either failed or returned non-PDF content.
+    """
+    urls = find_oa_pdf_urls(doi=doi, openalex_pdf_url=openalex_pdf_url)
+    if not urls:
+        return None
+    for u in urls:
+        print(f"  trying OA mirror: {u[:80]}...", file=sys.stderr)
+        pdf = try_download_pdf(u)
+        if pdf:
+            return pdf
+    return None
 
 
 def get_paper_info_doi(doi: str):
@@ -886,8 +938,14 @@ def _fetch_pmc_to_disk(pmcid: str) -> None:
 
 
 def _fetch_chemrxiv_to_disk(doi: str) -> None:
-    """ChemRxiv full-text: try to grab the PDF; if Cloudflare blocks us,
-    print the URL so the user can fetch it via a real browser."""
+    """ChemRxiv full-text. Layered chain:
+       1. OA mirror (Unpaywall / OpenAlex / Crossref) — catches the ~60-80%
+          that also live on a non-Cloudflared host (published version,
+          institutional repo, arXiv cross-post).
+       2. Direct chemrxiv.org download (usually 403 but free to try).
+       3. Playwright headless browser — passes Cloudflare Turnstile.
+       4. Print URL for manual download.
+    """
     safe = doi.lower().replace("/", "_")
     pdf_path = OUTPUT_DIR / f"{safe}.pdf"
     txt_path = OUTPUT_DIR / f"{safe}.txt"
@@ -895,27 +953,121 @@ def _fetch_chemrxiv_to_disk(doi: str) -> None:
         print(f"Already exists: {txt_path if txt_path.exists() else pdf_path}")
         return
 
-    print(f"Attempting ChemRxiv PDF for {doi}...", file=sys.stderr)
-    pdf = fetch_chemrxiv_pdf(doi)
+    # Resolve OpenAlex OA URL in case cache has one already.
+    openalex_pdf = None
+    cached = get_cached_paper(f"doi:{doi.lower()}")
+    if cached and cached.pdf_url and "chemrxiv.org" not in cached.pdf_url:
+        openalex_pdf = cached.pdf_url
+
+    print(f"[1/3] Trying OA mirrors for {doi}...", file=sys.stderr)
+    pdf = _try_oa_mirror_for_pdf(doi=doi, openalex_pdf_url=openalex_pdf)
     if pdf:
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        pdf_path.write_bytes(pdf)
-        print(f"Saved PDF: {pdf_path} ({len(pdf):,} bytes)")
-        text = _extract_pdf_text(pdf)
-        if text:
-            txt_path.write_text(
-                f"# DOI:{doi}\n\n## Full Text\n\n{text}", encoding="utf-8",
-            )
-            print(f"Saved text: {txt_path} ({len(text):,} chars)")
+        _save_pdf_and_text(pdf, safe)
         return
 
-    url = chemrxiv_pdf_url(doi) or f"https://chemrxiv.org/engage/chemrxiv/article-details/{doi}"
+    print(f"[2/3] Trying direct ChemRxiv PDF (likely Cloudflared)...", file=sys.stderr)
+    pdf = fetch_chemrxiv_pdf(doi)
+    if pdf:
+        _save_pdf_and_text(pdf, safe)
+        return
+
+    # Layer 2a: click-path — open the HTML article page and hit its
+    # "Download PDF" link like a real user would. Works because
+    # Cloudflare's cookie gets applied to same-origin link clicks.
+    article_url = f"https://chemrxiv.org/doi/full/{doi}"
+    print(f"[3a/3] Trying browser click-path via {article_url[:80]}...",
+          file=sys.stderr)
+    pdf = browser_download_via_click(article_url)
+    if pdf:
+        _save_pdf_and_text(pdf, safe)
+        return
+
+    # Layer 2b: direct PDF URL fetch with warmup cookie. Stricter CF
+    # zones on the asset gateway often reject this path too, but worth a try.
+    landing_url = chemrxiv_pdf_url(doi) or article_url
+    print(f"[3b/3] Trying direct browser fetch of {landing_url[:80]}...",
+          file=sys.stderr)
+    pdf = browser_download_pdf(landing_url, warmup_url=article_url)
+    if pdf:
+        _save_pdf_and_text(pdf, safe)
+        return
+
     print(
-        f"\nChemRxiv PDFs sit behind Cloudflare Turnstile, which blocks non-browser clients.\n"
-        f"Open this URL manually to download:\n  {url}\n",
+        f"\nAll automatic full-text paths failed for {doi}.\n"
+        f"Open this URL in a real browser to download:\n  {landing_url}\n",
         file=sys.stderr,
     )
     sys.exit(1)
+
+
+def _fetch_biorxiv_to_disk(doi: str) -> None:
+    """bioRxiv / medRxiv full text. Layered chain:
+       1. If Europe PMC has a PMC full-text copy (some preprints get one),
+          use the existing PMC chain (JATS XML → BioC JSON → PMC PDF).
+       2. OA mirror discovery (Unpaywall / OpenAlex / Crossref).
+       3. Playwright on the biorxiv.org landing page.
+    """
+    safe = doi.lower().replace("/", "_")
+
+    # 1. Europe PMC might have a PMC copy; re-use PMC chain.
+    from lit.sources.europepmc import _fetch_paper_europepmc_by_doi
+    epmc = _fetch_paper_europepmc_by_doi(doi)
+    if epmc and epmc.pmcid:
+        print(f"[1/3] Europe PMC has {epmc.pmcid} for this preprint; using PMC chain.",
+              file=sys.stderr)
+        _fetch_pmc_to_disk(epmc.pmcid)
+        return
+
+    # 2. OA mirrors.
+    print(f"[1/3] Trying OA mirrors for {doi}...", file=sys.stderr)
+    openalex_pdf = None
+    cached = get_cached_paper(f"doi:{doi.lower()}")
+    if cached and cached.pdf_url and "biorxiv" not in cached.pdf_url.lower() \
+                                  and "medrxiv" not in cached.pdf_url.lower():
+        openalex_pdf = cached.pdf_url
+    pdf = _try_oa_mirror_for_pdf(doi=doi, openalex_pdf_url=openalex_pdf)
+    if pdf:
+        _save_pdf_and_text(pdf, safe)
+        return
+
+    # 3. Playwright on the canonical PDF URL.
+    # bioRxiv / medRxiv PDF URL template: {site}/content/{DOI}v{n}.full.pdf
+    # We don't always know the version, so try the landing page; the browser
+    # will follow links and pick up any PDF response.
+    is_medrxiv = "medrxiv" in ((cached.pdf_url if cached else "") or "").lower()
+    site = "medrxiv" if is_medrxiv else "biorxiv"
+    landing = f"https://www.{site}.org/content/{doi}.full.pdf"
+    warmup = f"https://www.{site}.org/content/{doi}"
+    print(f"[2/3] Trying headless browser on {landing}...", file=sys.stderr)
+    pdf = browser_download_pdf(landing, warmup_url=warmup)
+    if pdf:
+        _save_pdf_and_text(pdf, safe)
+        return
+
+    print(
+        f"\nAll automatic full-text paths failed for {doi}.\n"
+        f"Open this URL in a real browser to download:\n  {landing}\n",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def _ingest_local_pdf(path_str: str, out_basename: str) -> None:
+    """Manual-download escape hatch: take a user-supplied PDF file and run
+    it through the normal save-PDF-and-extract-text pipeline.
+
+    Useful when every automatic path has failed (Cloudflare / WAF blocks,
+    paywall, whatever) — the user downloads once via a real browser, then
+    points the tool at the file so caching + text extraction proceed."""
+    p = Path(path_str).expanduser().resolve()
+    if not p.exists():
+        print(f"Local file not found: {p}", file=sys.stderr)
+        sys.exit(1)
+    data = p.read_bytes()
+    if data[:4] != b"%PDF":
+        print(f"File is not a PDF (missing %PDF magic header): {p}", file=sys.stderr)
+        sys.exit(1)
+    _save_pdf_and_text(data, out_basename)
 
 
 def cmd_fulltext(args):
@@ -923,10 +1075,31 @@ def cmd_fulltext(args):
 
     - arxiv → existing tex source download (LaTeX, with PDF/text fallback)
     - pmcid → PMC fallback chain (JATS XML → BioC JSON → PDF + text)
-    - pmid  → ELink PMID → PMC ID → PMC chain
-    - doi (ChemRxiv, 10.26434/*) → best-effort Crossref-hosted PDF
+    - pmid  → PMC chain; fallback to OA-mirror lookup when no PMC copy
+    - doi (ChemRxiv 10.26434/*) → OA mirror → Cloudflared direct → headless browser
+    - doi (bioRxiv/medRxiv 10.1101/*) → Europe PMC PMC → OA mirror → headless browser
+
+    ``--from-file PATH`` is a universal escape hatch: if every automatic
+    path gets blocked (IP reputation / JS challenge / paywall), download
+    the PDF manually via a real browser and pass its path here. We'll
+    save + extract text like any other successful download.
     """
     id_type, clean_id = extract_paper_id(args.arxiv_id)
+
+    if args.from_file:
+        # Derive a stable basename from whichever ID form we were given.
+        if id_type == "pmid":
+            basename = f"PMID{clean_id}"
+        elif id_type == "pmcid":
+            basename = clean_id.upper()
+        elif id_type == "doi":
+            basename = clean_id.lower().replace("/", "_")
+        elif id_type == "arxiv":
+            basename = clean_id.replace("/", "_")
+        else:
+            basename = clean_id
+        _ingest_local_pdf(args.from_file, basename)
+        return
 
     if id_type == "arxiv":
         cmd_tex(argparse.Namespace(arxiv_id=clean_id))
@@ -937,26 +1110,44 @@ def cmd_fulltext(args):
         return
 
     if id_type == "pmid":
-        # Cached metadata may already carry a pmcid; otherwise ask NCBI directly.
+        # First try the PMC chain — structured XML / BioC / PDF from NCBI.
         paper = get_paper_info_pubmed(clean_id)
         pmcid = paper.pmcid if paper and paper.pmcid else pmid_to_pmcid(clean_id)
-        if not pmcid:
-            print(
-                f"\nPMID:{clean_id} has no associated PMC full-text. "
-                f"Closed-access papers cannot be downloaded.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        _fetch_pmc_to_disk(pmcid)
-        return
+        if pmcid:
+            _fetch_pmc_to_disk(pmcid)
+            return
+
+        # No PMC copy → try OA mirrors (publisher OA, institutional repos).
+        # Layer-1 covers many papers marked "closed access" in PubMed.
+        doi_for_pmid = paper.doi if paper else None
+        print(
+            f"PMID:{clean_id} has no PMC copy — trying OA mirrors...",
+            file=sys.stderr,
+        )
+        if doi_for_pmid:
+            pdf = _try_oa_mirror_for_pdf(doi=doi_for_pmid)
+            if pdf:
+                _save_pdf_and_text(pdf, f"PMID{clean_id}")
+                return
+
+        print(
+            f"\nNo open-access full-text found for PMID:{clean_id} "
+            f"(no PMC copy, no OA mirror).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if id_type == "doi" and is_chemrxiv_doi(clean_id):
         _fetch_chemrxiv_to_disk(clean_id)
         return
 
+    if id_type == "doi" and _is_biorxiv_doi(clean_id):
+        _fetch_biorxiv_to_disk(clean_id)
+        return
+
     print(
         f"Unrecognised or unsupported identifier '{args.arxiv_id}' — `fulltext` "
-        f"supports arXiv ID, PMID, PMC ID, and ChemRxiv DOI.",
+        f"supports arXiv ID, PMID, PMC ID, ChemRxiv DOI, bioRxiv/medRxiv DOI.",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -1063,9 +1254,15 @@ def main():
     tex_parser.set_defaults(func=cmd_tex)
 
     fulltext_parser = subparsers.add_parser(
-        "fulltext", help="下载全文：arXiv 走 LaTeX/PDF, PMC 走 JATS XML"
+        "fulltext", help="下载全文: 分层 fallback (JATS→BioC→PDF; OA mirror; Playwright)"
     )
-    fulltext_parser.add_argument("arxiv_id", help="arXiv ID / PMID / PMC ID")
+    fulltext_parser.add_argument(
+        "arxiv_id", help="arXiv ID / PMID / PMC ID / ChemRxiv DOI / bioRxiv DOI",
+    )
+    fulltext_parser.add_argument(
+        "--from-file", metavar="PATH",
+        help="手动兜底: 已经通过浏览器下载好的 PDF 路径, 跳过全部在线下载直接提文本入库",
+    )
     fulltext_parser.set_defaults(func=cmd_fulltext)
 
     args = parser.parse_args()

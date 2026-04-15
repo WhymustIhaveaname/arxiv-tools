@@ -572,6 +572,105 @@ class TestNormalizePubmedSearch:
         assert result[0]["authors"] == "Author A"
 
 
+class TestOAMirror:
+    """Layer-1 OA mirror discovery + PDF validation."""
+
+    def test_find_urls_dedups_and_prefers_openalex_first(self):
+        from lit.oa_mirror import find_oa_pdf_urls
+        with patch("lit.oa_mirror._unpaywall_urls", return_value=["https://dup.pdf", "https://u.pdf"]), \
+             patch("lit.oa_mirror._crossref_tdm_pdf_urls", return_value=["https://dup.pdf", "https://c.pdf"]):
+            urls = find_oa_pdf_urls(doi="10.1/x", openalex_pdf_url="https://oa.pdf")
+        assert urls == ["https://oa.pdf", "https://dup.pdf", "https://u.pdf", "https://c.pdf"]
+
+    def test_find_urls_tolerates_missing_contact_email(self):
+        """_unpaywall_urls silently skips when CONTACT_EMAIL is empty."""
+        from lit.oa_mirror import _unpaywall_urls
+        with patch("lit.oa_mirror.CONTACT_EMAIL", ""):
+            assert _unpaywall_urls("10.1/x") == []
+
+    def test_try_download_pdf_rejects_html_masquerading_as_pdf(self):
+        """HTML bodies must not be saved as .pdf (Cloudflare challenge pages)."""
+        from lit.oa_mirror import try_download_pdf
+
+        class R:
+            content = b"<!DOCTYPE html>...<title>Just a moment...</title>"
+            def raise_for_status(self): pass
+
+        with patch("lit.oa_mirror._request_with_retry", return_value=R()):
+            assert try_download_pdf("https://host/file") is None
+
+    def test_try_download_pdf_returns_bytes_for_valid_pdf(self):
+        from lit.oa_mirror import try_download_pdf
+
+        class R:
+            content = b"%PDF-1.7\n... fake ..."
+            def raise_for_status(self): pass
+
+        with patch("lit.oa_mirror._request_with_retry", return_value=R()):
+            got = try_download_pdf("https://host/file")
+        assert got is not None and got.startswith(b"%PDF")
+
+
+class TestBrowserModule:
+    """Soft-import behavior of lit/browser.py when Playwright is absent."""
+
+    def test_missing_playwright_returns_none(self, capsys):
+        from lit import browser
+
+        # Simulate Playwright not installed.
+        def _bad_import():
+            raise ImportError("no playwright")
+
+        with patch.object(browser, "_import_playwright_sync", return_value=None):
+            assert browser.browser_download_pdf("https://x") is None
+            assert browser.browser_download_via_click("https://x") is None
+
+
+class TestFulltextDispatch:
+    """cmd_fulltext ID-type routing."""
+
+    def _args(self, arxiv_id, from_file=None):
+        return argparse.Namespace(arxiv_id=arxiv_id, from_file=from_file)
+
+    def test_biorxiv_doi_routes_to_biorxiv_handler(self):
+        with patch("arxiv_tool._fetch_biorxiv_to_disk") as mock_bx, \
+             patch("arxiv_tool._fetch_chemrxiv_to_disk") as mock_cx:
+            arxiv_tool.cmd_fulltext(self._args("10.1101/2024.01.01.12345"))
+            mock_bx.assert_called_once_with("10.1101/2024.01.01.12345")
+            mock_cx.assert_not_called()
+
+    def test_chemrxiv_doi_routes_to_chemrxiv_handler(self):
+        with patch("arxiv_tool._fetch_biorxiv_to_disk") as mock_bx, \
+             patch("arxiv_tool._fetch_chemrxiv_to_disk") as mock_cx:
+            arxiv_tool.cmd_fulltext(self._args("10.26434/chemrxiv-2024-abc"))
+            mock_cx.assert_called_once_with("10.26434/chemrxiv-2024-abc")
+            mock_bx.assert_not_called()
+
+    def test_from_file_bypasses_all_network_paths(self, tmp_path, cache_db):
+        pdf = tmp_path / "paper.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n minimal \n%%EOF")
+        with patch("arxiv_tool._fetch_biorxiv_to_disk") as mock_bx, \
+             patch("arxiv_tool._fetch_chemrxiv_to_disk") as mock_cx, \
+             patch("arxiv_tool._fetch_pmc_to_disk") as mock_pmc:
+            # Sends through the --from-file path regardless of ID type.
+            arxiv_tool.OUTPUT_DIR = tmp_path  # redirect save target
+            arxiv_tool.cmd_fulltext(self._args("10.26434/foo", from_file=str(pdf)))
+            mock_bx.assert_not_called()
+            mock_cx.assert_not_called()
+            mock_pmc.assert_not_called()
+        assert (tmp_path / "10.26434_foo.pdf").exists()
+
+    def test_from_file_rejects_non_pdf(self, tmp_path):
+        not_a_pdf = tmp_path / "junk.txt"
+        not_a_pdf.write_text("this is not a PDF")
+        with pytest.raises(SystemExit):
+            arxiv_tool.cmd_fulltext(self._args("10.1/x", from_file=str(not_a_pdf)))
+
+    def test_from_file_rejects_missing_path(self):
+        with pytest.raises(SystemExit):
+            arxiv_tool.cmd_fulltext(self._args("10.1/x", from_file="/no/such/path.pdf"))
+
+
 class TestEuropePMC:
     """Europe PMC search query builder + annotations grouping."""
 

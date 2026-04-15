@@ -159,11 +159,43 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fulltext <PMID>      # ELink → PM
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fulltext <PMC ID>    # Direct Europe PMC JATS XML
 ```
 
-Dispatches by ID type:
-- arXiv → LaTeX source from arxiv.org/e-print + PDF text-extraction fallback
-- PMC ID → fallback chain: JATS XML (Europe PMC) → BioC JSON (NCBI) → PDF+text (PyMuPDF). Every PMC OA paper gets at least one readable format.
-- PMID → ELink resolves to PMC, then the PMC chain above; exits if the paper has no OA full text anywhere
-- ChemRxiv DOI → attempt PDF download (likely blocked by Cloudflare); on failure, prints the publisher URL so the user can open it in a real browser
+Dispatches by ID type with a layered fallback strategy:
+
+- **arXiv** → LaTeX source from arxiv.org/e-print + PDF text-extraction fallback
+- **PMC ID** → JATS XML (Europe PMC) → BioC JSON (NCBI) → PDF+text (PyMuPDF)
+- **PMID** → PMC chain if available; when no PMC copy, tries **OA mirror discovery** (Unpaywall + OpenAlex `best_oa_location` + Crossref TDM links) for publisher OA / institutional repo copies
+- **ChemRxiv DOI** (`10.26434/*`) → OA mirrors → direct ChemRxiv PDF → **headless browser via Playwright** (click-path then direct with warmup cookie); Cloudflare often wins, so final fallback is printing the URL
+- **bioRxiv / medRxiv DOI** (`10.1101/*`) → Europe PMC preprint full-text → OA mirrors → Playwright browser
+
+#### Manual escape hatch: `--from-file PATH`
+
+When every automatic path fails (IP reputation, Cloudflare, paywall),
+download the PDF yourself via a real browser and feed it in:
+
+```bash
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fulltext <ID> --from-file ~/Downloads/paper.pdf
+```
+
+Runs the normal PyMuPDF text extraction + cache save, with the ID's canonical
+filename, so the `.txt` output plugs into the same reading workflow as any
+automatic download.
+
+#### Installing the headless browser (optional)
+
+For Cloudflare-protected sources (ChemRxiv, bioRxiv, medRxiv), install
+Playwright + Chromium once:
+
+```bash
+pip install playwright
+playwright install chromium
+
+# or ephemeral via uv:
+uv run --with playwright python -m playwright install chromium
+```
+
+Without Playwright the tool still works — OA-mirror paths cover ~60-80%
+of ChemRxiv papers (published versions / institutional repos / arXiv
+cross-posts), and `--from-file` covers the rest.
 
 ### bib — generate BibTeX citation
 
