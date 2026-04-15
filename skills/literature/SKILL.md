@@ -48,6 +48,17 @@ PubMed-specific filters (work with `--source pubmed`):
 MeSH and field tags pass through the query directly, e.g.
 `search 'CRISPR-Cas Systems[MeSH]' --source pubmed`.
 
+ChemRxiv-specific filters (`--source chemrxiv`):
+
+```bash
+--year 2024              # filter posting year (also accepts ranges)
+--offset 20              # pagination
+```
+
+ChemRxiv DOIs (`10.26434/chemrxiv-*`) are handled automatically for
+`info`/`bib`/`cited`/`references`. Search routes through Crossref because
+chemrxiv.org's native API is Cloudflare-blocked for non-browser clients.
+
 S2-specific filter parameters:
 
 ```bash
@@ -116,6 +127,7 @@ Dispatches by ID type:
 - arXiv → LaTeX source from arxiv.org/e-print + PDF text-extraction fallback
 - PMC ID → fallback chain: JATS XML (Europe PMC) → BioC JSON (NCBI) → PDF+text (PyMuPDF). Every PMC OA paper gets at least one readable format.
 - PMID → ELink resolves to PMC, then the PMC chain above; exits if the paper has no OA full text anywhere
+- ChemRxiv DOI → attempt PDF download (likely blocked by Cloudflare); on failure, prints the publisher URL so the user can open it in a real browser
 
 ### bib — generate BibTeX citation
 

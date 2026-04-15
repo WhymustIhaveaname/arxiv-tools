@@ -66,6 +66,14 @@ from lit.bibtex import (
 )
 from lit.crossref import fetch_bibtex_crossref
 from lit.enrich import enrich_paper_ids
+from lit.sources.chemrxiv import (
+    _fetch_paper_chemrxiv,
+    _normalize_chemrxiv_search,
+    _search_chemrxiv,
+    chemrxiv_pdf_url,
+    fetch_chemrxiv_pdf,
+    is_chemrxiv_doi,
+)
 from lit.ratelimit import RateLimiter, _brief_error, _request_with_retry
 from lit.fulltext import (
     _extract_braced_arg,
@@ -177,13 +185,34 @@ def get_paper_info_pubmed(pmid: str):
 
 
 def get_paper_info_doi(doi: str):
-    """Cache-aware DOI metadata fetch via OpenAlex + cross-ref write."""
+    """Cache-aware DOI metadata fetch.
+
+    For ChemRxiv DOIs (10.26434/...) we merge OpenAlex (for the abstract —
+    Crossref rarely has it for ChemRxiv) with ChemRxiv/Crossref metadata
+    (for ``source``, ``categories``, PDF URL). For other DOIs, OpenAlex
+    alone is enough.
+    """
     cache_key = f"doi:{doi.lower()}"
     cached = get_cached_paper(cache_key)
     if cached:
         return cached
 
     paper = _fetch_paper_openalex_spec(f"DOI:{doi}")
+
+    if is_chemrxiv_doi(doi):
+        chem = _fetch_paper_chemrxiv(doi)
+        if chem is not None:
+            if paper is None:
+                paper = chem
+            else:
+                # Keep OpenAlex's richer abstract, but overlay ChemRxiv-specific
+                # fields so downstream display / caching looks correct.
+                paper.source = "chemrxiv"
+                if chem.pdf_url:
+                    paper.pdf_url = chem.pdf_url
+                if chem.categories and not paper.categories:
+                    paper.categories = chem.categories
+
     if not paper:
         return None
 
@@ -258,6 +287,24 @@ def cmd_search(args):
             results = ("PubMed", _normalize_pubmed_search(raw))
         if not results:
             print("No results from PubMed")
+            return
+        source_name, normalized = results
+        print(f"\nFound {len(normalized)} papers ({source_name}):\n")
+        _print_search_results(normalized)
+        return
+
+    if source == "chemrxiv":
+        print("Searching ChemRxiv (via Crossref)...", file=sys.stderr)
+        raw = _search_chemrxiv(
+            args.query,
+            args.max,
+            offset=getattr(args, "offset", 0) or 0,
+            year=getattr(args, "year", None),
+        )
+        if raw:
+            results = ("ChemRxiv", _normalize_chemrxiv_search(raw))
+        if not results:
+            print("No results from ChemRxiv")
             return
         source_name, normalized = results
         print(f"\nFound {len(normalized)} papers ({source_name}):\n")
@@ -696,12 +743,46 @@ def _fetch_pmc_to_disk(pmcid: str) -> None:
     sys.exit(1)
 
 
+def _fetch_chemrxiv_to_disk(doi: str) -> None:
+    """ChemRxiv full-text: try to grab the PDF; if Cloudflare blocks us,
+    print the URL so the user can fetch it via a real browser."""
+    safe = doi.lower().replace("/", "_")
+    pdf_path = OUTPUT_DIR / f"{safe}.pdf"
+    txt_path = OUTPUT_DIR / f"{safe}.txt"
+    if txt_path.exists() or pdf_path.exists():
+        print(f"Already exists: {txt_path if txt_path.exists() else pdf_path}")
+        return
+
+    print(f"Attempting ChemRxiv PDF for {doi}...", file=sys.stderr)
+    pdf = fetch_chemrxiv_pdf(doi)
+    if pdf:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        pdf_path.write_bytes(pdf)
+        print(f"Saved PDF: {pdf_path} ({len(pdf):,} bytes)")
+        text = _extract_pdf_text(pdf)
+        if text:
+            txt_path.write_text(
+                f"# DOI:{doi}\n\n## Full Text\n\n{text}", encoding="utf-8",
+            )
+            print(f"Saved text: {txt_path} ({len(text):,} chars)")
+        return
+
+    url = chemrxiv_pdf_url(doi) or f"https://chemrxiv.org/engage/chemrxiv/article-details/{doi}"
+    print(
+        f"\nChemRxiv PDFs sit behind Cloudflare Turnstile, which blocks non-browser clients.\n"
+        f"Open this URL manually to download:\n  {url}\n",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def cmd_fulltext(args):
     """Dispatch full-text fetch by ID type:
 
     - arxiv → existing tex source download (LaTeX, with PDF/text fallback)
-    - pmcid → Europe PMC JATS XML
-    - pmid  → ELink PMID → PMC ID → JATS XML
+    - pmcid → PMC fallback chain (JATS XML → BioC JSON → PDF + text)
+    - pmid  → ELink PMID → PMC ID → PMC chain
+    - doi (ChemRxiv, 10.26434/*) → best-effort Crossref-hosted PDF
     """
     id_type, clean_id = extract_paper_id(args.arxiv_id)
 
@@ -727,9 +808,13 @@ def cmd_fulltext(args):
         _fetch_pmc_to_disk(pmcid)
         return
 
+    if id_type == "doi" and is_chemrxiv_doi(clean_id):
+        _fetch_chemrxiv_to_disk(clean_id)
+        return
+
     print(
-        f"Unrecognised identifier '{args.arxiv_id}' — `fulltext` supports "
-        f"arXiv ID, PMID, and PMC ID.",
+        f"Unrecognised or unsupported identifier '{args.arxiv_id}' — `fulltext` "
+        f"supports arXiv ID, PMID, PMC ID, and ChemRxiv DOI.",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -760,9 +845,9 @@ def main():
     search_parser.add_argument("--max", type=int, default=20, help="最大结果数 (默认 20)")
     search_parser.add_argument(
         "--source",
-        choices=["auto", "s2", "openalex", "arxiv", "pubmed"],
+        choices=["auto", "s2", "openalex", "arxiv", "pubmed", "chemrxiv"],
         default="auto",
-        help="数据源: auto=自动(S2→OpenAlex→arXiv), s2, openalex, arxiv, pubmed (默认 auto)",
+        help="数据源: auto=自动(S2→OpenAlex→arXiv), s2, openalex, arxiv, pubmed, chemrxiv (默认 auto)",
     )
     search_parser.add_argument("--year", help="年份或范围 (如 2024, 2020-2024, 2020-)")
     search_parser.add_argument("--fields-of-study", help="研究领域，逗号分隔 (如 Computer Science,Physics)")

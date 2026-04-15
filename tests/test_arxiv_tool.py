@@ -572,6 +572,82 @@ class TestNormalizePubmedSearch:
         assert result[0]["authors"] == "Author A"
 
 
+class TestChemRxivAdapter:
+    """ChemRxiv-via-Crossref search + metadata + Cloudflare-block handling."""
+
+    CROSSREF_ITEM = {
+        "DOI": "10.26434/chemrxiv-2024-XYZ",
+        "title": ["A Paper About Catalysis"],
+        "author": [
+            {"given": "Jane", "family": "Smith"},
+            {"given": "Bob", "family": "Jones"},
+        ],
+        "posted": {"date-parts": [[2024, 6, 15]]},
+        "is-referenced-by-count": 7,
+        "abstract": "<jats:p>We report a novel <jats:italic>catalyst</jats:italic>.</jats:p>",
+        "link": [
+            {"URL": "https://chemrxiv.org/.../paper.pdf",
+             "content-type": "application/pdf"},
+        ],
+        "subject": ["Catalysis", "Organic Chemistry"],
+    }
+
+    def test_is_chemrxiv_doi(self):
+        from lit.sources.chemrxiv import is_chemrxiv_doi
+        assert is_chemrxiv_doi("10.26434/chemrxiv-2024-abc")
+        assert is_chemrxiv_doi("10.26434/chemrxiv.12151809.v1")
+        assert not is_chemrxiv_doi("10.1038/s41586-020-2649-2")
+        assert not is_chemrxiv_doi("10.48550/arXiv.1706.03762")
+
+    def test_normalize_search(self):
+        from lit.sources.chemrxiv import _normalize_chemrxiv_search
+        out = _normalize_chemrxiv_search([self.CROSSREF_ITEM])
+        assert out[0]["id"] == "DOI:10.26434/chemrxiv-2024-XYZ"
+        assert out[0]["title"] == "A Paper About Catalysis"
+        assert out[0]["authors"] == "Jane Smith, Bob Jones"
+        assert out[0]["year"] == "2024"
+        assert out[0]["cited_by"] == 7
+        assert "catalyst" in (out[0]["abstract"] or "")
+        assert "<" not in (out[0]["abstract"] or "")  # JATS tags stripped
+
+    def test_fetch_paper_builds_full_cached_paper(self):
+        from lit.sources.chemrxiv import _fetch_paper_chemrxiv
+        with patch("lit.sources.chemrxiv.fetch_crossref_work", return_value=self.CROSSREF_ITEM):
+            paper = _fetch_paper_chemrxiv("10.26434/chemrxiv-2024-XYZ")
+        assert paper is not None
+        assert paper.source == "chemrxiv"
+        assert paper.doi == "10.26434/chemrxiv-2024-XYZ"
+        assert paper.year == 2024
+        assert [a.name for a in paper.authors] == ["Jane Smith", "Bob Jones"]
+        assert "catalyst" in paper.abstract
+        assert paper.pdf_url.endswith(".pdf")
+        assert "Catalysis" in paper.categories
+
+    def test_pdf_fetch_returns_none_on_cloudflare_challenge(self):
+        """fetch_chemrxiv_pdf should return None when Cloudflare returns HTML."""
+        from lit.sources.chemrxiv import fetch_chemrxiv_pdf
+
+        class R:
+            content = b"<!DOCTYPE html><html><head>Cloudflare challenge</head>"
+            def raise_for_status(self): pass
+
+        with patch("lit.sources.chemrxiv.fetch_crossref_work", return_value=self.CROSSREF_ITEM), \
+             patch("lit.sources.chemrxiv._request_with_retry", return_value=R()):
+            assert fetch_chemrxiv_pdf("10.26434/chemrxiv-2024-XYZ") is None
+
+    def test_pdf_fetch_returns_bytes_when_response_is_pdf(self):
+        from lit.sources.chemrxiv import fetch_chemrxiv_pdf
+
+        class R:
+            content = b"%PDF-1.4\n... fake pdf bytes ..."
+            def raise_for_status(self): pass
+
+        with patch("lit.sources.chemrxiv.fetch_crossref_work", return_value=self.CROSSREF_ITEM), \
+             patch("lit.sources.chemrxiv._request_with_retry", return_value=R()):
+            got = fetch_chemrxiv_pdf("10.26434/chemrxiv-2024-XYZ")
+        assert got is not None and got.startswith(b"%PDF")
+
+
 class TestBuildPubmedTerm:
     """PubMed ESearch term-string assembly."""
 
