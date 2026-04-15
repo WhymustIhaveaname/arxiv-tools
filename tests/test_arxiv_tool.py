@@ -572,6 +572,130 @@ class TestNormalizePubmedSearch:
         assert result[0]["authors"] == "Author A"
 
 
+class TestEuropePMC:
+    """Europe PMC search query builder + annotations grouping."""
+
+    def test_build_query_plain(self):
+        from lit.sources.europepmc import _build_europepmc_query
+        assert _build_europepmc_query("CRISPR") == "(CRISPR)"
+
+    def test_build_query_year_range(self):
+        from lit.sources.europepmc import _build_europepmc_query
+        t = _build_europepmc_query("cancer", year="2020-2024")
+        assert "(cancer)" in t
+        assert "FIRST_PDATE:[2020-01-01 TO 2024-12-31]" in t
+
+    def test_build_query_open_access_and_source(self):
+        from lit.sources.europepmc import _build_europepmc_query
+        t = _build_europepmc_query("CRISPR", open_access=True, src="ppr")
+        assert "OPEN_ACCESS:y" in t
+        assert "SRC:PPR" in t
+
+    def test_article_id_prefers_pmc(self):
+        from lit.sources.europepmc import _article_id_for_annotations
+        assert _article_id_for_annotations(pmid="1", pmcid="PMC99") == "PMC:PMC99"
+        assert _article_id_for_annotations(pmid="1", pmcid=None) == "MED:1"
+        assert _article_id_for_annotations(pmid=None, pmcid="99") == "PMC:PMC99"
+        assert _article_id_for_annotations(pmid=None, pmcid=None) is None
+
+    def test_normalize_search(self):
+        from lit.sources.europepmc import _normalize_europepmc_search
+        records = [{
+            "source": "MED",
+            "id": "123",
+            "pmid": "123",
+            "pmcid": "PMC999",
+            "doi": "10.1/x",
+            "title": "Sample Paper.",
+            "authorString": "Smith J, Jones A",
+            "pubYear": "2024",
+            "citedByCount": 5,
+            "abstractText": "<h4>Background</h4>This is the abstract.",
+        }]
+        out = _normalize_europepmc_search(records)
+        assert out[0]["id"] == "PMID:123"
+        assert out[0]["title"] == "Sample Paper"          # trailing '.' stripped
+        assert out[0]["authors"] == "Smith J, Jones A"
+        assert out[0]["year"] == "2024"
+        assert out[0]["cited_by"] == 5
+        assert "<" not in (out[0]["abstract"] or "")      # tags stripped
+
+    def test_group_annotations_preserves_order(self):
+        from lit.sources.europepmc import group_annotations_by_type
+        annos = [
+            {"type": "Gene_Proteins", "exact": "TP53"},
+            {"type": "Diseases", "exact": "cancer"},
+            {"type": "Gene_Proteins", "exact": "BRCA1"},
+        ]
+        g = group_annotations_by_type(annos)
+        assert set(g.keys()) == {"Gene_Proteins", "Diseases"}
+        assert [a["exact"] for a in g["Gene_Proteins"]] == ["TP53", "BRCA1"]
+
+    def test_record_to_cached_paper(self):
+        from lit.sources.europepmc import _record_to_cached_paper
+        rec = {
+            "title": "Foo.",
+            "pubYear": "2023",
+            "pmid": "123",
+            "pmcid": "PMC9",
+            "doi": "10.1/x",
+            "authorList": {"author": [{"fullName": "Jane Smith"}, {"fullName": "Bob Jones"}]},
+            "abstractText": "<p>Interesting.</p>",
+            "journalInfo": {"journal": {"title": "Nature"}},
+            "fullTextUrlList": {"fullTextUrl": [
+                {"documentStyle": "html", "url": "https://h"},
+                {"documentStyle": "pdf", "url": "https://p.pdf"},
+            ]},
+        }
+        p = _record_to_cached_paper(rec)
+        assert p.title == "Foo"
+        assert p.year == 2023
+        assert p.pmid == "123"
+        assert p.pmcid == "PMC9"
+        assert p.doi == "10.1/x"
+        assert [a.name for a in p.authors] == ["Jane Smith", "Bob Jones"]
+        assert p.abstract == "Interesting."
+        assert p.categories == ["Nature"]
+        assert p.pdf_url == "https://p.pdf"
+        assert p.source == "europepmc"
+
+
+class TestCmdAnnotations:
+    """cmd_annotations dispatch and output."""
+
+    def _args(self, arxiv_id, type_="all", max_per_type=30):
+        return argparse.Namespace(arxiv_id=arxiv_id, type=type_, max_per_type=max_per_type)
+
+    def test_pmcid_queries_pmc(self, capsys, cache_db):
+        fake = [
+            {"type": "Gene_Proteins", "exact": "TP53",
+             "tags": [{"uri": "https://uniprot.org/TP53"}]},
+            {"type": "Gene_Proteins", "exact": "TP53",
+             "tags": [{"uri": "https://uniprot.org/TP53"}]},
+            {"type": "Diseases", "exact": "cancer", "tags": []},
+        ]
+        with patch("arxiv_tool.fetch_annotations", return_value=fake) as mock_fa:
+            arxiv_tool.cmd_annotations(self._args("PMC1234"))
+            mock_fa.assert_called_once()
+            # PMC path: called with pmcid, pmid=None
+            assert mock_fa.call_args.kwargs["pmcid"] == "PMC1234"
+            assert mock_fa.call_args.kwargs["pmid"] is None
+        out = capsys.readouterr().out
+        assert "3 annotations for PMC:PMC1234" in out
+        assert "TP53" in out
+        assert "[2×]" in out          # dedup count
+        assert "cancer" in out
+
+    def test_type_filter_translated(self, cache_db):
+        with patch("arxiv_tool.fetch_annotations", return_value=[]) as mock_fa:
+            arxiv_tool.cmd_annotations(self._args("PMC1", type_="genes,diseases"))
+            assert mock_fa.call_args.kwargs["types"] == ["genes", "diseases"]
+
+    def test_unknown_id_exits(self):
+        with pytest.raises(SystemExit):
+            arxiv_tool.cmd_annotations(self._args("not an id"))
+
+
 class TestChemRxivAdapter:
     """ChemRxiv-via-Crossref search + metadata + Cloudflare-block handling."""
 

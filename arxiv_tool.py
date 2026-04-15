@@ -89,7 +89,15 @@ from lit.sources.arxiv_api import (
     _normalize_arxiv_search,
     search_papers,
 )
-from lit.sources.europepmc import fetch_pmc_fulltext_xml
+from lit.sources.europepmc import (
+    ANNOTATION_TYPE_MAP,
+    _fetch_paper_europepmc_by_doi,
+    _normalize_europepmc_search,
+    _search_europepmc,
+    fetch_annotations,
+    fetch_pmc_fulltext_xml,
+    group_annotations_by_type,
+)
 from lit.sources.ncbi_bioc import fetch_pmc_bioc_json
 from lit.sources.pubmed import (
     _fetch_paper_pubmed,
@@ -184,13 +192,40 @@ def get_paper_info_pubmed(pmid: str):
     return paper
 
 
+def _merge_europepmc_into(base, extra):
+    """Overlay Europe PMC metadata onto an existing CachedPaper without losing
+    anything the primary source already populated."""
+    if not base.abstract and extra.abstract:
+        base.abstract = extra.abstract
+    if not base.pdf_url and extra.pdf_url:
+        base.pdf_url = extra.pdf_url
+    if not base.categories and extra.categories:
+        base.categories = extra.categories
+    if not base.pmid and extra.pmid:
+        base.pmid = extra.pmid
+    if not base.pmcid and extra.pmcid:
+        base.pmcid = extra.pmcid
+    if not base.year and extra.year:
+        base.year = extra.year
+    return base
+
+
+def _is_biomed_preprint_doi(doi: str) -> bool:
+    """bioRxiv / medRxiv / Research Square DOI prefixes — papers likely to
+    be in Europe PMC but missing from OpenAlex's preprint index."""
+    low = doi.lower()
+    return low.startswith("10.1101/") or low.startswith("10.21203/")
+
+
 def get_paper_info_doi(doi: str):
     """Cache-aware DOI metadata fetch.
 
-    For ChemRxiv DOIs (10.26434/...) we merge OpenAlex (for the abstract —
-    Crossref rarely has it for ChemRxiv) with ChemRxiv/Crossref metadata
-    (for ``source``, ``categories``, PDF URL). For other DOIs, OpenAlex
-    alone is enough.
+    Dispatch rules:
+    - ChemRxiv DOIs (10.26434/…) → OpenAlex for abstract + Crossref for
+      categories / PDF URL.
+    - bioRxiv / medRxiv / Research Square DOIs → Europe PMC first (its
+      preprint coverage is better), fall back to OpenAlex.
+    - Everything else → OpenAlex.
     """
     cache_key = f"doi:{doi.lower()}"
     cached = get_cached_paper(cache_key)
@@ -212,6 +247,11 @@ def get_paper_info_doi(doi: str):
                     paper.pdf_url = chem.pdf_url
                 if chem.categories and not paper.categories:
                     paper.categories = chem.categories
+
+    if _is_biomed_preprint_doi(doi) and (paper is None or not paper.abstract):
+        epmc = _fetch_paper_europepmc_by_doi(doi)
+        if epmc is not None:
+            paper = epmc if paper is None else _merge_europepmc_into(paper, epmc)
 
     if not paper:
         return None
@@ -287,6 +327,25 @@ def cmd_search(args):
             results = ("PubMed", _normalize_pubmed_search(raw))
         if not results:
             print("No results from PubMed")
+            return
+        source_name, normalized = results
+        print(f"\nFound {len(normalized)} papers ({source_name}):\n")
+        _print_search_results(normalized)
+        return
+
+    if source == "europepmc":
+        print("Searching Europe PMC...", file=sys.stderr)
+        raw = _search_europepmc(
+            args.query,
+            args.max,
+            offset=getattr(args, "offset", 0) or 0,
+            year=getattr(args, "year", None),
+            open_access=getattr(args, "open_access", False),
+        )
+        if raw:
+            results = ("Europe PMC", _normalize_europepmc_search(raw))
+        if not results:
+            print("No results from Europe PMC")
             return
         source_name, normalized = results
         print(f"\nFound {len(normalized)} papers ({source_name}):\n")
@@ -572,6 +631,89 @@ def cmd_cited(args):
         _print_citations_openalex(results, start_num)
 
 
+def cmd_annotations(args):
+    """Text-mined entity annotations from Europe PMC.
+
+    Shows each recognised gene / disease / chemical / organism / GO term
+    / experimental method / accession number with its canonical ontology
+    URI. PMC full-text papers have the richest annotations; PubMed-only
+    records fall back to title+abstract mining.
+    """
+    id_type, clean_id = extract_paper_id(args.arxiv_id)
+
+    pmid = pmcid = None
+    if id_type == "pmcid":
+        pmcid = clean_id.upper()
+    elif id_type == "pmid":
+        pmid = clean_id
+        # Try to resolve PMC too so we get full-text annotations when available.
+        paper = get_paper_info_pubmed(clean_id)
+        if paper and paper.pmcid:
+            pmcid = paper.pmcid.upper()
+    elif id_type == "doi":
+        paper = get_paper_info_doi(clean_id)
+        if paper is None:
+            print(f"Paper not found for DOI:{clean_id}", file=sys.stderr)
+            sys.exit(1)
+        pmid = paper.pmid
+        pmcid = paper.pmcid
+        if not pmid and not pmcid:
+            print(
+                f"No PubMed/PMC mapping for DOI:{clean_id} — Europe PMC's "
+                f"annotation API is PubMed/PMC-keyed only.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    else:
+        print(
+            f"Unrecognised identifier '{args.arxiv_id}' — annotations accepts "
+            f"PMID, PMC ID, or a DOI that Europe PMC can resolve to one.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    types: list[str] | None = None
+    if args.type and args.type != "all":
+        types = [t.strip() for t in args.type.split(",") if t.strip()]
+
+    annos = fetch_annotations(pmid=pmid, pmcid=pmcid, types=types)
+    if annos is None:
+        print("Annotations fetch failed (network or API error).", file=sys.stderr)
+        sys.exit(1)
+    if not annos:
+        display = f"PMC:{pmcid}" if pmcid else f"PMID:{pmid}"
+        print(f"No text-mined annotations for {display}.")
+        return
+
+    grouped = group_annotations_by_type(annos)
+    display = f"PMC:{pmcid}" if pmcid else f"PMID:{pmid}"
+    print(f"\n{len(annos)} annotations for {display}:\n")
+    for type_name in sorted(grouped):
+        bucket = grouped[type_name]
+        # Deduplicate by surface string + URI so the same gene mentioned
+        # 10 times shows up once with a count.
+        seen: dict[tuple[str, str], int] = {}
+        for a in bucket:
+            surface = (a.get("exact") or "").strip()
+            uri = ""
+            for tag in a.get("tags") or []:
+                if tag.get("uri"):
+                    uri = tag["uri"]
+                    break
+            key = (surface.lower(), uri)
+            seen[key] = seen.get(key, 0) + 1
+        print(f"=== {type_name} ({len(bucket)} mentions, {len(seen)} unique) ===")
+        ordered = sorted(seen.items(), key=lambda kv: (-kv[1], kv[0][0]))
+        for (surface, uri), count in ordered[: args.max_per_type]:
+            tail = f"  [{count}×]" if count > 1 else ""
+            extra = f"  {uri}" if uri else ""
+            # find a representative tag name when the exact surface is cryptic
+            print(f"  • {surface}{tail}{extra}")
+        if len(ordered) > args.max_per_type:
+            print(f"  … and {len(ordered) - args.max_per_type} more unique entities")
+        print()
+
+
 def _references_via_pubmed(pmid: str, max_results: int, offset: int) -> tuple[list[dict], int] | None:
     """ELink pubmed_pubmed_refs → ESummary batch. Fallback when S2 has no data."""
     ref_pmids = fetch_pubmed_references(pmid)
@@ -845,9 +987,9 @@ def main():
     search_parser.add_argument("--max", type=int, default=20, help="最大结果数 (默认 20)")
     search_parser.add_argument(
         "--source",
-        choices=["auto", "s2", "openalex", "arxiv", "pubmed", "chemrxiv"],
+        choices=["auto", "s2", "openalex", "arxiv", "pubmed", "chemrxiv", "europepmc"],
         default="auto",
-        help="数据源: auto=自动(S2→OpenAlex→arXiv), s2, openalex, arxiv, pubmed, chemrxiv (默认 auto)",
+        help="数据源: auto=自动(S2→OpenAlex→arXiv), s2, openalex, arxiv, pubmed, chemrxiv, europepmc (默认 auto)",
     )
     search_parser.add_argument("--year", help="年份或范围 (如 2024, 2020-2024, 2020-)")
     search_parser.add_argument("--fields-of-study", help="研究领域，逗号分隔 (如 Computer Science,Physics)")
@@ -887,6 +1029,26 @@ def main():
         help="数据源: auto=自动(S2优先), s2=Semantic Scholar, openalex=OpenAlex (默认 auto)",
     )
     cited_parser.set_defaults(func=cmd_cited)
+
+    annotations_parser = subparsers.add_parser(
+        "annotations",
+        help="Europe PMC 文本挖掘实体 (基因/疾病/化学物质/生物/GO/方法/数据集 ID)",
+    )
+    annotations_parser.add_argument(
+        "arxiv_id", help="PMID / PMC ID / DOI (DOI 需能映射到 PubMed/PMC)",
+    )
+    annotations_parser.add_argument(
+        "--type", default="all",
+        help=(
+            "实体类型, 逗号分隔; 可选: "
+            f"{', '.join(sorted(ANNOTATION_TYPE_MAP.keys()))}. 默认 all"
+        ),
+    )
+    annotations_parser.add_argument(
+        "--max-per-type", type=int, default=30,
+        help="每个类型最多显示多少条不重复实体 (默认 30)",
+    )
+    annotations_parser.set_defaults(func=cmd_annotations)
 
     references_parser = subparsers.add_parser(
         "references", help="正向引用: 这篇论文引用了哪些 (S2 优先, PMID 时 PubMed ELink 兜底)"

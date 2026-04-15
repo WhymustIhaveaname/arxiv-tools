@@ -48,6 +48,20 @@ PubMed-specific filters (work with `--source pubmed`):
 MeSH and field tags pass through the query directly, e.g.
 `search 'CRISPR-Cas Systems[MeSH]' --source pubmed`.
 
+Europe PMC-specific notes (`--source europepmc`):
+
+```bash
+--year 2020 / 2020-2024
+--offset 20
+--open-access
+```
+
+Europe PMC's query DSL passes through, so you can write e.g.
+`search 'SRC:PPR AND CRISPR' --source europepmc` to restrict to preprints,
+or `TITLE:"foo" AND AUTH:"Smith"` for field-tagged searches. Covers
+PubMed + PMC + preprints (bioRxiv/medRxiv/Research Square) + patents in one
+API.
+
 ChemRxiv-specific filters (`--source chemrxiv`):
 
 ```bash
@@ -106,6 +120,28 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" references <ID> --max 50 --offset 2
 Order: S2 `/paper/{id}/references` first (rich metadata in one call); when
 S2 has no data for a PubMed paper, falls back to NCBI ELink
 `pubmed_pubmed_refs` + ESummary.
+
+### annotations — text-mined entities (Europe PMC)
+
+Pull text-mined biomedical / chemical entities from Europe PMC's
+Annotations API — genes, diseases, chemicals, organisms, Gene Ontology
+terms, experimental methods, and dataset accession numbers, each with
+a canonical ontology URI (UniProt / UMLS / CHEBI / GO / etc.).
+
+```bash
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" annotations <PMID>
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" annotations <PMC ID>
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" annotations <DOI>                    # must map to PubMed/PMC
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" annotations <ID> --type genes,diseases
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" annotations <ID> --max-per-type 10
+```
+
+Supported `--type` values: `genes`, `diseases`, `chemicals`, `organisms`,
+`go`, `methods`, `accessions`, `resources`, `all` (default).
+
+Entities are deduplicated per type (same surface string + URI collapse to
+one line with a `[N×]` mention count). PMC full-text gives the richest
+annotations; PubMed-only records fall back to title+abstract mining.
 
 ### tex — download LaTeX source (arXiv only)
 
