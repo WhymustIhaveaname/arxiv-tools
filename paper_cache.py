@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS papers (
     source     TEXT,
     doi        TEXT,
     pmid       TEXT,
-    pmcid      TEXT
+    pmcid      TEXT,
+    native_arxiv_id TEXT,
+    year       INTEGER
 )"""
 
 # Columns added after the initial schema; checked on every connection and
@@ -36,6 +38,11 @@ _NULLABLE_COLUMNS = [
     ("doi", "TEXT"),
     ("pmid", "TEXT"),
     ("pmcid", "TEXT"),
+    # native_arxiv_id: the bare arXiv ID (no "arxiv:" prefix). Kept separate from
+    # the cache PK so cross-reference rows (pmid:/doi:/...) can still record the
+    # arXiv identity of the same paper.
+    ("native_arxiv_id", "TEXT"),
+    ("year", "INTEGER"),
 ]
 
 
@@ -53,6 +60,7 @@ class CachedPaper:
     pdf_url: str = ""
     year: int | None = None
     source: str | None = None
+    arxiv_id: str | None = None
     doi: str | None = None
     pmid: str | None = None
     pmcid: str | None = None
@@ -112,20 +120,24 @@ def get_cached_paper(arxiv_id: str) -> CachedPaper | None:
     conn = _get_conn()
     try:
         row = conn.execute(
-            "SELECT title, authors, abstract, categories, pdf_url, source, doi, pmid, pmcid "
+            "SELECT title, authors, abstract, categories, pdf_url, source, "
+            "doi, pmid, pmcid, native_arxiv_id, year "
             "FROM papers WHERE arxiv_id = ?",
             (_normalize_paper_id(arxiv_id),),
         ).fetchone()
         if row is None:
             return None
-        title, authors_json, abstract, categories_json, pdf_url, source, doi, pmid, pmcid = row
+        title, authors_json, abstract, categories_json, pdf_url, source, \
+            doi, pmid, pmcid, arxiv_id_col, year = row
         return CachedPaper(
             title=title,
             authors=[CachedAuthor(name) for name in json.loads(authors_json)],
             abstract=abstract,
             categories=json.loads(categories_json),
             pdf_url=pdf_url,
+            year=year,
             source=source,
+            arxiv_id=arxiv_id_col,
             doi=doi,
             pmid=pmid,
             pmcid=pmcid,
@@ -141,8 +153,8 @@ def cache_paper(arxiv_id: str, paper: CachedPaper, bibtex: str) -> None:
             conn.execute(
                 """INSERT OR REPLACE INTO papers
                    (arxiv_id, title, authors, abstract, categories, pdf_url, bibtex,
-                    cached_at, source, doi, pmid, pmcid)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    cached_at, source, doi, pmid, pmcid, native_arxiv_id, year)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     _normalize_paper_id(arxiv_id),
                     paper.title,
@@ -156,10 +168,42 @@ def cache_paper(arxiv_id: str, paper: CachedPaper, bibtex: str) -> None:
                     paper.doi,
                     paper.pmid,
                     paper.pmcid,
+                    paper.arxiv_id,
+                    paper.year,
                 ),
             )
     finally:
         conn.close()
+
+
+def cache_paper_with_crossrefs(primary_id: str, paper: CachedPaper, bibtex: str) -> None:
+    """Write the primary row + one cross-reference row per known ID.
+
+    So a paper that has arxiv_id="2401.12345", doi="10.x/y", pmid="39876543"
+    ends up with four identical cache rows — one per ID form the user might
+    look it up by. Each row carries the full metadata + the same bibtex, so
+    future lookups hit cache regardless of which identifier the user supplied.
+
+    Duplicate data, but each row is only a few KB and the DB stays trivially
+    small; reading is O(1) on the primary key either way.
+    """
+    primary_key = _normalize_paper_id(primary_id)
+    cache_paper(primary_key, paper, bibtex)
+
+    aliases: list[str] = []
+    if paper.arxiv_id:
+        aliases.append(f"arxiv:{paper.arxiv_id}")
+    if paper.doi:
+        aliases.append(f"doi:{paper.doi.lower()}")
+    if paper.pmid:
+        aliases.append(f"pmid:{paper.pmid}")
+    if paper.pmcid:
+        aliases.append(f"pmcid:{paper.pmcid.upper()}")
+
+    for alias in aliases:
+        if alias == primary_key:
+            continue
+        cache_paper(alias, paper, bibtex)
 
 
 def get_cached_bibtex(arxiv_id: str) -> str | None:

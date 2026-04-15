@@ -36,6 +36,18 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "keywords" --source s2|opena
 
 Works across all fields — S2 and OpenAlex cover chemistry, biology, medicine, physics, etc. For dedicated biomedical search (MeSH terms, clinical results), use `--source pubmed`.
 
+PubMed-specific filters (work with `--source pubmed`):
+
+```bash
+--year 2020              # single year
+--year 2020-2024         # year range (open-ended "2020-" / "-2015" ok)
+--offset 20              # skip first 20 results (pagination)
+--open-access            # restrict to free-full-text subset
+```
+
+MeSH and field tags pass through the query directly, e.g.
+`search 'CRISPR-Cas Systems[MeSH]' --source pubmed`.
+
 S2-specific filter parameters:
 
 ```bash
@@ -68,6 +80,22 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info https://pubmed.ncbi.nlm.nih.go
 ID type is auto-detected: arXiv ID / URL, PMID, PMC ID, DOI (bare or
 https://doi.org/...), or ncbi URLs.
 
+### references — forward citation lookup (this paper's bibliography)
+
+Inverse of `cited`. Returns the papers that this paper cites.
+
+```bash
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" references <arXiv ID>
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" references <PMID>
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" references <PMC ID>
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" references <DOI>
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" references <ID> --max 50 --offset 20
+```
+
+Order: S2 `/paper/{id}/references` first (rich metadata in one call); when
+S2 has no data for a PubMed paper, falls back to NCBI ELink
+`pubmed_pubmed_refs` + ESummary.
+
 ### tex — download LaTeX source (arXiv only)
 
 ```bash
@@ -86,8 +114,8 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fulltext <PMC ID>    # Direct Europ
 
 Dispatches by ID type:
 - arXiv → LaTeX source from arxiv.org/e-print + PDF text-extraction fallback
-- PMC ID → Europe PMC `/PMC/{id}/fullTextXML` (JATS XML for OA papers)
-- PMID → ELink resolves to PMC, then Europe PMC XML; exits if the paper has no OA full text
+- PMC ID → fallback chain: JATS XML (Europe PMC) → BioC JSON (NCBI) → PDF+text (PyMuPDF). Every PMC OA paper gets at least one readable format.
+- PMID → ELink resolves to PMC, then the PMC chain above; exits if the paper has no OA full text anywhere
 
 ### bib — generate BibTeX citation
 

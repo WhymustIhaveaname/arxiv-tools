@@ -572,6 +572,146 @@ class TestNormalizePubmedSearch:
         assert result[0]["authors"] == "Author A"
 
 
+class TestBuildPubmedTerm:
+    """PubMed ESearch term-string assembly."""
+
+    def test_plain_query(self):
+        from lit.sources.pubmed import _build_pubmed_term
+        assert _build_pubmed_term("CRISPR") == "(CRISPR)"
+
+    def test_single_year(self):
+        from lit.sources.pubmed import _build_pubmed_term
+        t = _build_pubmed_term("CRISPR", year="2020")
+        assert t == '(CRISPR) AND "2020"[PDAT]'
+
+    def test_year_range(self):
+        from lit.sources.pubmed import _build_pubmed_term
+        t = _build_pubmed_term("cancer", year="2020-2024")
+        assert t == '(cancer) AND "2020":"2024"[PDAT]'
+
+    def test_open_access_filter(self):
+        from lit.sources.pubmed import _build_pubmed_term
+        t = _build_pubmed_term("CRISPR", open_access=True)
+        assert '[sb]' in t
+        assert "loattrfree full text" in t
+
+    def test_all_filters_combined(self):
+        from lit.sources.pubmed import _build_pubmed_term
+        t = _build_pubmed_term("cancer", year="2020-2024", open_access=True)
+        assert t == '(cancer) AND "2020":"2024"[PDAT] AND "loattrfree full text"[sb]'
+
+
+class TestEnrichPolicy:
+    """enrich_paper_ids should only fill PMID/PMCID, never overwrite DOI/year/arxiv_id."""
+
+    def test_fills_missing_pmid_and_pmcid(self):
+        from lit.enrich import enrich_paper_ids
+        enriched = CachedPaper(
+            title="X", authors=[CachedAuthor("A")],
+            pmid="123", pmcid="PMC9", doi="junk", year=9999, arxiv_id="junk",
+        )
+        paper = CachedPaper(title="X", authors=[CachedAuthor("A")], doi="10.x/y")
+        with patch("lit.enrich._fetch_paper_openalex_spec", return_value=enriched):
+            enrich_paper_ids(paper)
+        assert paper.pmid == "123"
+        assert paper.pmcid == "PMC9"
+
+    def test_does_not_overwrite_doi_or_year_or_arxiv_id(self):
+        from lit.enrich import enrich_paper_ids
+        enriched = CachedPaper(
+            title="X", authors=[CachedAuthor("A")],
+            pmid="123", doi="10.65215/SYNTHETIC", year=2025, arxiv_id="WRONG",
+        )
+        paper = CachedPaper(
+            title="X", authors=[CachedAuthor("A")],
+            doi="10.real/paper", year=2017, arxiv_id="1706.03762",
+        )
+        with patch("lit.enrich._fetch_paper_openalex_spec", return_value=enriched):
+            enrich_paper_ids(paper)
+        assert paper.doi == "10.real/paper"
+        assert paper.year == 2017
+        assert paper.arxiv_id == "1706.03762"
+        assert paper.pmid == "123"  # only this gets filled
+
+    def test_short_circuits_when_both_pmid_and_pmcid_present(self):
+        from lit.enrich import enrich_paper_ids
+        paper = CachedPaper(title="X", authors=[], pmid="1", pmcid="PMC1")
+        with patch("lit.enrich._fetch_paper_openalex_spec") as mock_oa:
+            enrich_paper_ids(paper)
+            mock_oa.assert_not_called()
+
+
+class TestCrossrefCacheRows:
+    """cache_paper_with_crossrefs writes one row per known ID."""
+
+    def test_writes_alias_rows(self, cache_db):
+        from paper_cache import cache_paper_with_crossrefs, get_cached_paper
+        paper = CachedPaper(
+            title="Multi-ID paper",
+            authors=[CachedAuthor("A")],
+            arxiv_id="2401.00001",
+            doi="10.1/x",
+            pmid="999",
+            pmcid="PMC999",
+            source="pubmed",
+        )
+        cache_paper_with_crossrefs("pmid:999", paper, "@article{x}")
+
+        for key in ("pmid:999", "doi:10.1/x", "pmcid:PMC999", "arxiv:2401.00001"):
+            hit = get_cached_paper(key)
+            assert hit is not None, f"expected alias row for {key}"
+            assert hit.title == "Multi-ID paper"
+
+    def test_does_not_duplicate_primary(self, cache_db):
+        """If the primary key would be one of the aliases, don't write it twice."""
+        from paper_cache import cache_paper_with_crossrefs, _get_conn
+        paper = CachedPaper(
+            title="X",
+            authors=[CachedAuthor("A")],
+            pmid="999",
+        )
+        cache_paper_with_crossrefs("pmid:999", paper, "bib")
+        conn = _get_conn()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM papers WHERE arxiv_id = 'pmid:999'"
+        ).fetchone()[0]
+        assert count == 1
+
+
+class TestCmdReferences:
+    """cmd_references dispatches and renders correctly."""
+
+    def _args(self, arxiv_id, max_=5, offset=0):
+        return argparse.Namespace(arxiv_id=arxiv_id, max=max_, offset=offset)
+
+    def test_arxiv_goes_to_s2_with_arxiv_spec(self, capsys):
+        fake = [{"title": "Ref A", "authors": [{"name": "A"}], "externalIds": {}, "citationCount": 5, "year": 2020}]
+        with patch("arxiv_tool._fetch_references_s2_spec", return_value=(fake, 1)) as mock_s2:
+            arxiv_tool.cmd_references(self._args("1706.03762"))
+            mock_s2.assert_called_once_with("ArXiv:1706.03762", 5, 0)
+        assert "Ref A" in capsys.readouterr().out
+
+    def test_pmid_goes_to_s2_first(self, capsys):
+        fake = [{"title": "Ref B", "authors": [], "externalIds": {}, "citationCount": 0, "year": 2021}]
+        with patch("arxiv_tool._fetch_references_s2_spec", return_value=(fake, 1)) as mock_s2, \
+             patch("arxiv_tool._references_via_pubmed") as mock_pm:
+            arxiv_tool.cmd_references(self._args("32866453"))
+            mock_s2.assert_called_once_with("PMID:32866453", 5, 0)
+            mock_pm.assert_not_called()
+
+    def test_pmid_falls_back_to_pubmed_when_s2_empty(self, capsys):
+        with patch("arxiv_tool._fetch_references_s2_spec", return_value=([], 0)), \
+             patch("arxiv_tool._references_via_pubmed",
+                   return_value=([{"uid": "1", "title": "Pm Ref", "authors": [], "pubdate": "2022"}], 1)) as mock_pm:
+            arxiv_tool.cmd_references(self._args("32866453"))
+            mock_pm.assert_called_once_with("32866453", 5, 0)
+        assert "Pm Ref" in capsys.readouterr().out
+
+    def test_unknown_id_exits(self):
+        with pytest.raises(SystemExit):
+            arxiv_tool.cmd_references(self._args("not an id"))
+
+
 class TestFetchPaperPubmedParsing:
     """EFetch XML → CachedPaper."""
 

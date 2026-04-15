@@ -6,10 +6,15 @@ import sys
 
 import requests
 
+import re
+
 from lit.config import CONTACT_EMAIL, OPENALEX_API_BASE, OPENALEX_API_KEY
 from lit.ids import _truncate_authors
 from lit.ratelimit import _brief_error, _request_with_retry
 from paper_cache import CachedAuthor, CachedPaper
+
+
+_ARXIV_FROM_DOI_RE = re.compile(r"10\.48550/arxiv\.(.+)$", re.IGNORECASE)
 
 
 def _openalex_params(**extra) -> dict[str, str]:
@@ -118,6 +123,20 @@ def _fetch_paper_openalex_spec(paper_spec: str) -> CachedPaper | None:
     if oa.get("pdf_url"):
         pdf_url = oa["pdf_url"]
 
+    # OpenAlex carries the arXiv ID either in ids.arxiv or as an arXiv-pattern DOI.
+    arxiv_id_field = ""
+    for key, val in ids.items():
+        if "arxiv" in key.lower() and val:
+            if "/abs/" in val:
+                arxiv_id_field = val.rsplit("/abs/", 1)[-1]
+            else:
+                arxiv_id_field = val
+            break
+    if not arxiv_id_field and doi_field:
+        m = _ARXIV_FROM_DOI_RE.match(doi_field)
+        if m:
+            arxiv_id_field = m.group(1)
+
     return CachedPaper(
         title=data["title"],
         authors=authors,
@@ -125,6 +144,7 @@ def _fetch_paper_openalex_spec(paper_spec: str) -> CachedPaper | None:
         pdf_url=pdf_url,
         year=data.get("publication_year"),
         source="openalex",
+        arxiv_id=arxiv_id_field or None,
         doi=doi_field or None,
         pmid=pmid_field or None,
         pmcid=pmcid_field or None,
@@ -132,12 +152,25 @@ def _fetch_paper_openalex_spec(paper_spec: str) -> CachedPaper | None:
 
 
 def _fetch_paper_openalex(arxiv_id: str) -> CachedPaper | None:
-    """Back-compat wrapper for arXiv IDs."""
+    """Back-compat wrapper for arXiv IDs.
+
+    OpenAlex has known-flaky metadata for arXiv papers (synthetic 10.65215/…
+    DOIs and re-indexing years). Since we queried by arXiv ID, we know the
+    canonical values; override anything OpenAlex reported that's obviously
+    wrong for an arXiv paper.
+    """
+    from lit.ids import _arxiv_year  # local import to avoid an import cycle
+
     paper = _fetch_paper_openalex_spec(f"ArXiv:{arxiv_id}")
     if paper is None:
         return None
-    # Preserve the legacy pdf_url shape that the arxiv path expects.
+    paper.arxiv_id = arxiv_id
     paper.pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
+    if not paper.doi or paper.doi.lower().startswith("10.65215/"):
+        paper.doi = f"10.48550/arXiv.{arxiv_id}"
+    arxiv_y = _arxiv_year(arxiv_id)
+    if arxiv_y:
+        paper.year = arxiv_y
     return paper
 
 

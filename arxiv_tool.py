@@ -65,6 +65,7 @@ from lit.bibtex import (
     generate_citation_key,
 )
 from lit.crossref import fetch_bibtex_crossref
+from lit.enrich import enrich_paper_ids
 from lit.ratelimit import RateLimiter, _brief_error, _request_with_retry
 from lit.fulltext import (
     _extract_braced_arg,
@@ -81,10 +82,14 @@ from lit.sources.arxiv_api import (
     search_papers,
 )
 from lit.sources.europepmc import fetch_pmc_fulltext_xml
+from lit.sources.ncbi_bioc import fetch_pmc_bioc_json
 from lit.sources.pubmed import (
     _fetch_paper_pubmed,
     _normalize_pubmed_search,
     _search_pubmed,
+    fetch_esummary_batch,
+    fetch_pmc_pdf,
+    fetch_pubmed_references,
     pmcid_to_pmid,
     pmid_to_pmcid,
     print_pubmed_info,
@@ -106,6 +111,7 @@ from lit.sources.s2 import (
     _fetch_citations_s2,
     _fetch_citations_s2_spec,
     _fetch_paper_s2,
+    _fetch_references_s2_spec,
     _normalize_s2_search,
     _print_citations_s2,
     _s2_headers,
@@ -113,7 +119,14 @@ from lit.sources.s2 import (
     _search_s2,
     _search_s2_bulk,
 )
-from paper_cache import cache_paper, get_cached_bibtex, get_cached_paper
+from paper_cache import (
+    CachedAuthor,
+    CachedPaper,
+    cache_paper,
+    cache_paper_with_crossrefs,
+    get_cached_bibtex,
+    get_cached_paper,
+)
 
 OUTPUT_DIR = CACHE_DIR
 
@@ -135,16 +148,19 @@ def get_paper_info(arxiv_id: str):
         print(f"Paper not found: {clean_id}", file=sys.stderr)
         return None
 
+    enrich_paper_ids(paper)
     bibtex = generate_bibtex(paper, clean_id)
-    cache_paper(clean_id, paper, bibtex)
+    cache_paper_with_crossrefs(f"arxiv:{clean_id}", paper, bibtex)
     return paper
 
 
 def get_paper_info_pubmed(pmid: str):
-    """Cache-aware PubMed metadata fetch.
+    """Cache-aware PubMed metadata fetch with cross-ref rows written on miss.
 
-    Looks up ``pmid:<pmid>`` in the shared cache before hitting EFetch.
-    Cached entries write an empty bibtex; cmd_bib will fill it in on first call.
+    Looks up ``pmid:<pmid>`` (or any alias) in the shared cache before hitting
+    EFetch. On miss, fetches + enriches IDs via OpenAlex + writes one cache row
+    per known ID so subsequent DOI/arXiv/PMC lookups of the same paper hit.
+    Cached entries carry an empty bibtex until cmd_bib fills it in.
     """
     cache_key = f"pmid:{pmid}"
     cached = get_cached_paper(cache_key)
@@ -155,14 +171,13 @@ def get_paper_info_pubmed(pmid: str):
     if not paper:
         return None
 
-    cache_paper(cache_key, paper, "")
+    enrich_paper_ids(paper)
+    cache_paper_with_crossrefs(cache_key, paper, "")
     return paper
 
 
 def get_paper_info_doi(doi: str):
-    """Cache-aware DOI metadata fetch via OpenAlex (the freest source that
-    natively resolves DOIs and reconstructs abstracts).
-    """
+    """Cache-aware DOI metadata fetch via OpenAlex + cross-ref write."""
     cache_key = f"doi:{doi.lower()}"
     cached = get_cached_paper(cache_key)
     if cached:
@@ -172,7 +187,10 @@ def get_paper_info_doi(doi: str):
     if not paper:
         return None
 
-    cache_paper(cache_key, paper, "")
+    if not paper.doi:
+        paper.doi = doi
+    enrich_paper_ids(paper)
+    cache_paper_with_crossrefs(cache_key, paper, "")
     return paper
 
 
@@ -229,7 +247,13 @@ def cmd_search(args):
 
     if source == "pubmed":
         print("Searching PubMed...", file=sys.stderr)
-        raw = _search_pubmed(args.query, args.max)
+        raw = _search_pubmed(
+            args.query,
+            args.max,
+            offset=getattr(args, "offset", 0) or 0,
+            year=getattr(args, "year", None),
+            open_access=getattr(args, "open_access", False),
+        )
         if raw:
             results = ("PubMed", _normalize_pubmed_search(raw))
         if not results:
@@ -375,7 +399,7 @@ def _bib_for_pmid(pmid: str) -> str | None:
     if not bibtex:
         bibtex = generate_bibtex_pubmed(paper, pmid)
 
-    cache_paper(cache_key, paper, bibtex)
+    cache_paper_with_crossrefs(cache_key, paper, bibtex)
     return bibtex
 
 
@@ -395,7 +419,7 @@ def _bib_for_doi(doi: str) -> str | None:
         # Cache key didn't get populated by get_paper_info_doi; fabricate a
         # minimal CachedPaper so the bibtex still survives the round trip.
         paper = CachedPaper(title="", authors=[], doi=doi, source="crossref")
-    cache_paper(cache_key, paper, bibtex)
+    cache_paper_with_crossrefs(cache_key, paper, bibtex)
     return bibtex
 
 
@@ -501,6 +525,89 @@ def cmd_cited(args):
         _print_citations_openalex(results, start_num)
 
 
+def _references_via_pubmed(pmid: str, max_results: int, offset: int) -> tuple[list[dict], int] | None:
+    """ELink pubmed_pubmed_refs → ESummary batch. Fallback when S2 has no data."""
+    ref_pmids = fetch_pubmed_references(pmid)
+    if ref_pmids is None:
+        return None
+    total = len(ref_pmids)
+    if not ref_pmids:
+        return [], 0
+    page = ref_pmids[offset : offset + max_results]
+    records = fetch_esummary_batch(page)
+    if records is None:
+        return None
+    return records, total
+
+
+def _print_references_pubmed(records: list[dict], start: int = 1) -> None:
+    """Print ESummary records using the same shape as _print_citations_*."""
+    for i, r in enumerate(records, start):
+        pmid = r.get("uid") or ""
+        authors = [a["name"] for a in (r.get("authors") or []) if a.get("authtype") == "Author"]
+        if not authors:
+            authors = [a["name"] for a in (r.get("authors") or [])]
+        year = (r.get("pubdate") or r.get("epubdate") or "").split(" ")[0].split("-")[0] or "?"
+        tail = f"  PMID:{pmid}" if pmid else ""
+        print(f"[{i}] {r.get('title') or '(no title)'}")
+        print(f"    Authors: {_truncate_authors(authors)}")
+        print(f"    Year: {year}{tail}")
+        print()
+
+
+def cmd_references(args):
+    """Forward citations — the papers this paper cites.
+
+    Tries S2 first (covers every ID type, returns rich metadata in one shot).
+    Falls back to PubMed ELink for PMIDs when S2 has no reference data.
+    """
+    id_type, clean_id = extract_paper_id(args.arxiv_id)
+
+    if id_type == "pmcid":
+        clean_id = _resolve_pmcid_or_die(clean_id)
+        id_type = "pmid"
+
+    if id_type == "arxiv":
+        paper_spec, display_id = f"ArXiv:{clean_id}", f"arXiv:{clean_id}"
+    elif id_type == "pmid":
+        paper_spec, display_id = f"PMID:{clean_id}", f"PMID:{clean_id}"
+    elif id_type == "doi":
+        paper_spec, display_id = f"DOI:{clean_id}", f"DOI:{clean_id}"
+    else:
+        print(
+            f"Unrecognised identifier '{args.arxiv_id}' — supported: arXiv ID, "
+            f"PMID, PMC ID, DOI.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    offset = args.offset
+    print(f"Querying Semantic Scholar: {paper_spec}")
+    ret = _fetch_references_s2_spec(paper_spec, args.max, offset)
+    if ret is not None and ret[0]:
+        refs, total = ret
+        start = offset + 1
+        end = offset + len(refs)
+        print(f"\nSource: Semantic Scholar")
+        print(f"Showing references #{start}-{end} of {total}:\n")
+        _print_citations_s2(refs, start)
+        return
+
+    if id_type == "pmid":
+        print("\nS2 returned no references; falling back to PubMed ELink...", file=sys.stderr)
+        pm_ret = _references_via_pubmed(clean_id, args.max, offset)
+        if pm_ret is not None and pm_ret[0]:
+            refs, total = pm_ret
+            start = offset + 1
+            end = offset + len(refs)
+            print(f"\nSource: PubMed ELink + ESummary")
+            print(f"Showing references #{start}-{end} of {total}:\n")
+            _print_references_pubmed(refs, start)
+            return
+
+    print(f"\nNo references found for {display_id}")
+
+
 def cmd_tex(args):
     result = fetch_tex_source(args.arxiv_id, OUTPUT_DIR)
     if result:
@@ -514,23 +621,79 @@ def cmd_tex(args):
         _fetch_pdf_fallback(args.arxiv_id, OUTPUT_DIR)
 
 
+def _extract_pdf_text(pdf_bytes: bytes) -> str | None:
+    """Pull plain text out of a PDF using PyMuPDF (fitz). Returns None on failure."""
+    import fitz
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        return None
+    try:
+        return "\n".join(page.get_text().strip() for page in doc)
+    finally:
+        doc.close()
+
+
 def _fetch_pmc_to_disk(pmcid: str) -> None:
-    out_path = OUTPUT_DIR / f"{pmcid.upper()}.xml"
-    if out_path.exists():
-        print(f"Already exists: {out_path}")
-        return
-    print(f"Downloading PMC full-text XML: {pmcid}")
-    xml = fetch_pmc_fulltext_xml(pmcid)
-    if not xml:
-        print(
-            f"\nNo OA full-text for {pmcid} on Europe PMC. The paper may be "
-            f"closed access or not yet indexed.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    """Download PMC full text using a fallback chain of formats.
+
+    Order (best-for-LLM first):
+      1. JATS XML from Europe PMC — structured paragraphs, section/figure/table tags
+      2. BioC JSON from NCBI — passage sequence, slightly broader coverage (~3M OA)
+      3. PDF from pmc.ncbi.nlm.nih.gov + PyMuPDF text extraction — last resort
+
+    Each successful step writes a file under OUTPUT_DIR and stops. The PDF
+    path writes both the PDF itself and an adjacent .txt of extracted text so
+    Claude can read either. If every format fails, exits non-zero.
+    """
+    pmc_up = pmcid.upper()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(xml, encoding="utf-8")
-    print(f"Saved: {out_path} ({len(xml):,} bytes)")
+
+    xml_path = OUTPUT_DIR / f"{pmc_up}.xml"
+    bioc_path = OUTPUT_DIR / f"{pmc_up}.bioc.json"
+    pdf_path = OUTPUT_DIR / f"{pmc_up}.pdf"
+    txt_path = OUTPUT_DIR / f"{pmc_up}.txt"
+    for existing in (xml_path, bioc_path, txt_path):
+        if existing.exists():
+            print(f"Already exists: {existing}")
+            return
+
+    print(f"[1/3] Trying Europe PMC JATS XML for {pmc_up}...", file=sys.stderr)
+    xml = fetch_pmc_fulltext_xml(pmc_up)
+    if xml:
+        xml_path.write_text(xml, encoding="utf-8")
+        print(f"Saved JATS XML: {xml_path} ({len(xml):,} bytes)")
+        return
+
+    print(f"[2/3] JATS unavailable — trying NCBI BioC JSON...", file=sys.stderr)
+    bioc = fetch_pmc_bioc_json(pmc_up)
+    if bioc:
+        bioc_path.write_text(bioc, encoding="utf-8")
+        print(f"Saved BioC JSON: {bioc_path} ({len(bioc):,} bytes)")
+        return
+
+    print(f"[3/3] Structured formats unavailable — trying PMC PDF...", file=sys.stderr)
+    pdf = fetch_pmc_pdf(pmc_up)
+    if pdf:
+        pdf_path.write_bytes(pdf)
+        print(f"Saved PDF: {pdf_path} ({len(pdf):,} bytes)")
+        text = _extract_pdf_text(pdf)
+        if text:
+            txt_path.write_text(
+                f"# {pmc_up}\n\nURL: https://pmc.ncbi.nlm.nih.gov/articles/{pmc_up}/\n\n## Full Text\n\n{text}",
+                encoding="utf-8",
+            )
+            print(f"Saved text: {txt_path} ({len(text):,} chars)")
+        else:
+            print("PDF text extraction failed; raw PDF is still usable.", file=sys.stderr)
+        return
+
+    print(
+        f"\nNo open-access full text available for {pmc_up} "
+        f"(JATS, BioC, and PDF all failed). Paper may be closed-access or withdrawn.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def cmd_fulltext(args):
@@ -610,6 +773,11 @@ def main():
     search_parser.add_argument("--bulk", action="store_true", help="使用 S2 bulk 搜索（最多 1000 条）")
     search_parser.add_argument("--sort", help="排序字段 (如 citationCount:desc, publicationDate:desc)")
     search_parser.add_argument("--token", help="bulk 搜索翻页 token")
+    # Common pagination offset (consumed by PubMed; S2/OpenAlex use their own).
+    search_parser.add_argument(
+        "--offset", type=int, default=0,
+        help="跳过前 N 条结果（PubMed 分页；S2/OpenAlex 用各自的机制）",
+    )
     search_parser.set_defaults(func=cmd_search)
 
     info_parser = subparsers.add_parser("info", help="获取论文信息（不下载全文）")
@@ -634,6 +802,14 @@ def main():
         help="数据源: auto=自动(S2优先), s2=Semantic Scholar, openalex=OpenAlex (默认 auto)",
     )
     cited_parser.set_defaults(func=cmd_cited)
+
+    references_parser = subparsers.add_parser(
+        "references", help="正向引用: 这篇论文引用了哪些 (S2 优先, PMID 时 PubMed ELink 兜底)"
+    )
+    references_parser.add_argument("arxiv_id", help="arXiv ID / PMID / PMC ID / DOI")
+    references_parser.add_argument("--max", type=int, default=20, help="最大显示条数 (默认 20)")
+    references_parser.add_argument("--offset", type=int, default=0, help="跳过前 N 条，用于翻页 (默认 0)")
+    references_parser.set_defaults(func=cmd_references)
 
     tex_parser = subparsers.add_parser("tex", help="下载 LaTeX 源文件并解压 (arXiv 专用)")
     tex_parser.add_argument("arxiv_id", help="arXiv ID")

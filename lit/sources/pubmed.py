@@ -27,6 +27,89 @@ def _pubmed_params(**extra) -> dict[str, str]:
     return extra
 
 
+def fetch_pmc_pdf(pmcid: str) -> bytes | None:
+    """Download the PMC-hosted PDF for an OA paper.
+
+    Used as the last resort when structured formats (JATS XML / BioC JSON)
+    are unavailable. Returns the raw PDF bytes or ``None`` on failure
+    (including 403/404 for closed-access papers).
+    """
+    bare = pmcid.upper()
+    if not bare.startswith("PMC"):
+        bare = f"PMC{bare}"
+    url = f"https://pmc.ncbi.nlm.nih.gov/articles/{bare}/pdf/"
+    try:
+        resp = _request_with_retry(
+            requests.get,
+            url,
+            service="pubmed",
+            headers=HTTP_HEADERS,
+            timeout=60,
+            allow_redirects=True,
+        )
+    except requests.RequestException as e:
+        print(f"PMC PDF fetch failed: {_brief_error(e)}", file=sys.stderr)
+        return None
+
+    if resp.content[:4] != b"%PDF":
+        return None
+    return resp.content
+
+
+def fetch_pubmed_references(pmid: str) -> list[str] | None:
+    """Fetch the PMIDs this PubMed paper cites.
+
+    Uses ELink with ``linkname=pubmed_pubmed_refs`` — PubMed's curated
+    forward-citation list (what ``cited`` is the inverse of).
+
+    Returns a list of PMID strings, or ``None`` on error. Empty list means
+    the paper has no references indexed in PubMed (common for very new
+    papers or letters/editorials).
+    """
+    url = f"{PUBMED_API_BASE}/elink.fcgi"
+    try:
+        resp = _request_with_retry(
+            requests.get,
+            url,
+            service="pubmed",
+            params=_pubmed_params(
+                dbfrom="pubmed",
+                db="pubmed",
+                linkname="pubmed_pubmed_refs",
+                id=pmid,
+                retmode="json",
+            ),
+            headers=HTTP_HEADERS,
+            timeout=30,
+        )
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"PubMed ELink refs fetch failed: {_brief_error(e)}", file=sys.stderr)
+        return None
+
+    for ls in data.get("linksets") or []:
+        for ldb in ls.get("linksetdbs") or []:
+            if ldb.get("linkname") == "pubmed_pubmed_refs":
+                return [str(x) for x in ldb.get("links") or []]
+    return []
+
+
+def fetch_esummary_batch(pmids: list[str]) -> list[dict] | None:
+    """Public wrapper around ``_esummary`` returning a list of ESummary dicts.
+
+    Used by the ``references`` subcommand to fetch full metadata for each
+    PMID returned by ELink, so the output matches ``cited``'s shape.
+    """
+    if not pmids:
+        return []
+    data = _esummary(pmids)
+    if not data:
+        return None
+    result_map = data.get("result") or {}
+    uids = result_map.get("uids") or pmids
+    return [result_map[uid] for uid in uids if uid in result_map]
+
+
 def pmid_to_pmcid(pmid: str) -> str | None:
     """Resolve a PMID to its PMC ID (PMCxxxxx) via NCBI ELink.
 
@@ -96,8 +179,44 @@ def pmcid_to_pmid(pmcid: str) -> str | None:
     return None
 
 
-def _esearch_pmids(query: str, max_results: int) -> list[str] | None:
+def _build_pubmed_term(
+    query: str,
+    *,
+    year: str | None = None,
+    open_access: bool = False,
+) -> str:
+    """Assemble an ESearch term string with optional filter clauses.
+
+    PubMed accepts field-tagged fragments joined by AND — ``(foo) AND
+    "2020:2024"[PDAT] AND "loattrfree full text"[sb]`` — so we build that
+    string directly rather than use the separate date/filter query params.
+    """
+    parts = [f"({query})"] if query.strip() else []
+    if year:
+        if "-" in year:
+            lo, hi = year.split("-", 1)
+            lo = lo.strip() or "1800"
+            hi = hi.strip() or "3000"
+            parts.append(f'"{lo}":"{hi}"[PDAT]')
+        else:
+            parts.append(f'"{year}"[PDAT]')
+    if open_access:
+        # The "loattrfree full text" subset is PubMed's canonical "free full
+        # text available" filter (covers PMC OA plus other free sources).
+        parts.append('"loattrfree full text"[sb]')
+    return " AND ".join(parts)
+
+
+def _esearch_pmids(
+    query: str,
+    max_results: int,
+    *,
+    offset: int = 0,
+    year: str | None = None,
+    open_access: bool = False,
+) -> list[str] | None:
     url = f"{PUBMED_API_BASE}/esearch.fcgi"
+    term = _build_pubmed_term(query, year=year, open_access=open_access)
     try:
         resp = _request_with_retry(
             requests.get,
@@ -105,8 +224,9 @@ def _esearch_pmids(query: str, max_results: int) -> list[str] | None:
             service="pubmed",
             params=_pubmed_params(
                 db="pubmed",
-                term=query,
+                term=term,
                 retmax=str(min(max_results, 1000)),
+                retstart=str(offset),
                 retmode="json",
             ),
             headers=HTTP_HEADERS,
@@ -141,13 +261,27 @@ def _esummary(pmids: list[str]) -> dict | None:
         return None
 
 
-def _search_pubmed(query: str, max_results: int = 20) -> list[dict] | None:
+def _search_pubmed(
+    query: str,
+    max_results: int = 20,
+    *,
+    offset: int = 0,
+    year: str | None = None,
+    open_access: bool = False,
+) -> list[dict] | None:
     """Search PubMed and return ESummary records.
 
     Two round trips: ESearch (get PMIDs) → ESummary (batch metadata).
     Abstracts are not returned by ESummary — use _fetch_paper_pubmed for those.
+
+    Filters:
+      ``year``        — "YYYY" or "YYYY-YYYY" (open-ended "2020-" / "-2015" OK)
+      ``offset``      — skip the first N matches (ESearch retstart)
+      ``open_access`` — restrict to the "free full text" subset
     """
-    pmids = _esearch_pmids(query, max_results)
+    pmids = _esearch_pmids(
+        query, max_results, offset=offset, year=year, open_access=open_access
+    )
     if not pmids:
         return None
 

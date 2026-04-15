@@ -109,7 +109,7 @@ def _fetch_paper_s2(arxiv_id: str) -> CachedPaper | None:
     try:
         resp = _request_with_retry(
             requests.get, url, service="s2",
-            params={"fields": "title,authors,abstract"},
+            params={"fields": "title,authors,abstract,year,externalIds"},
             headers=_s2_headers(),
             timeout=15,
         )
@@ -125,11 +125,22 @@ def _fetch_paper_s2(arxiv_id: str) -> CachedPaper | None:
     if not published:
         return None
 
+    ext = data.get("externalIds") or {}
+    pmcid = ext.get("PubMedCentral") or ""
+    if pmcid and not pmcid.upper().startswith("PMC"):
+        pmcid = f"PMC{pmcid}"
+
     return CachedPaper(
         title=data["title"],
         authors=[CachedAuthor(a["name"]) for a in data["authors"]],
         abstract=data.get("abstract") or "",
         pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
+        year=data.get("year"),
+        source="s2",
+        arxiv_id=ext.get("ArXiv") or arxiv_id,
+        doi=ext.get("DOI") or None,
+        pmid=ext.get("PubMed") or None,
+        pmcid=pmcid or None,
     )
 
 
@@ -189,6 +200,57 @@ def _fetch_citations_s2(
 ) -> tuple[list[dict], int] | None:
     """Back-compat wrapper for arXiv IDs — delegates to _fetch_citations_s2_spec."""
     return _fetch_citations_s2_spec(f"ArXiv:{arxiv_id}", max_results, offset)
+
+
+def _fetch_references_s2_spec(
+    paper_spec: str, max_results: int, offset: int = 0
+) -> tuple[list[dict], int] | None:
+    """Fetch the references (forward citations) of a paper via S2.
+
+    S2 exposes ``/paper/{paper_id}/references`` returning each cited paper.
+    Shape mirrors ``_fetch_citations_s2_spec`` so callers can reuse printers.
+    """
+    info_url = f"{S2_API_BASE}/paper/{paper_spec}"
+    try:
+        resp = _request_with_retry(
+            requests.get,
+            info_url,
+            service="s2",
+            params={"fields": "title,referenceCount"},
+            headers=_s2_headers(),
+            timeout=30,
+        )
+        paper_info = resp.json()
+        print(f"Paper: {paper_info['title']}")
+        print(f"Total references: {paper_info.get('referenceCount') or 0}")
+    except requests.RequestException as e:
+        print(f"Semantic Scholar query failed: {_brief_error(e)}", file=sys.stderr)
+        return None
+
+    refs_url = f"{S2_API_BASE}/paper/{paper_spec}/references"
+    try:
+        resp = _request_with_retry(
+            requests.get,
+            refs_url,
+            service="s2",
+            params={
+                "fields": "title,year,externalIds,citationCount,authors",
+                "offset": offset,
+                "limit": min(max_results, 1000),
+            },
+            headers=_s2_headers(),
+            timeout=30,
+        )
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"Semantic Scholar references fetch failed: {_brief_error(e)}", file=sys.stderr)
+        return None
+
+    results = [
+        item["citedPaper"] for item in data["data"]
+        if item.get("citedPaper") and item["citedPaper"].get("title")
+    ]
+    return results[:max_results], paper_info.get("referenceCount") or 0
 
 
 def _normalize_s2_search(results: list[dict]) -> list[dict]:
