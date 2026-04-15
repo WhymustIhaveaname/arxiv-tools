@@ -640,6 +640,45 @@ class TestFetchPaperPubmedParsing:
             paper = arxiv_tool._fetch_paper_pubmed("0")
         assert paper is None
 
+    def test_reference_pmc_ids_do_not_leak(self):
+        """ArticleIdLists nested under ReferenceList are for *cited* papers;
+        they must not clobber the main article's PMC ID. Regression test —
+        an earlier XPath `.//ArticleIdList/ArticleId` grabbed all of them."""
+        xml = b"""<?xml version="1.0"?>
+<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation>
+      <Article>
+        <ArticleTitle>Main Paper</ArticleTitle>
+        <AuthorList><Author><LastName>Smith</LastName><ForeName>J</ForeName></Author></AuthorList>
+        <Abstract><AbstractText>Abs</AbstractText></Abstract>
+      </Article>
+    </MedlineCitation>
+    <PubmedData>
+      <ArticleIdList>
+        <ArticleId IdType="pmc">PMC7610144</ArticleId>
+      </ArticleIdList>
+      <ReferenceList>
+        <Reference>
+          <ArticleIdList>
+            <ArticleId IdType="pmc">PMC99999999</ArticleId>
+          </ArticleIdList>
+        </Reference>
+        <Reference>
+          <ArticleIdList>
+            <ArticleId IdType="pmc">PMC88888888</ArticleId>
+          </ArticleIdList>
+        </Reference>
+      </ReferenceList>
+    </PubmedData>
+  </PubmedArticle>
+</PubmedArticleSet>"""
+        with patch("lit.sources.pubmed._request_with_retry",
+                   return_value=self._mock_resp(xml)):
+            paper = arxiv_tool._fetch_paper_pubmed("1")
+        assert paper is not None
+        assert paper.pmcid == "PMC7610144"
+
 
 class TestCmdInfoDispatch:
     """cmd_info routes to the right source based on ID type."""
@@ -647,7 +686,7 @@ class TestCmdInfoDispatch:
     def _args(self, arxiv_id):
         return argparse.Namespace(arxiv_id=arxiv_id)
 
-    def test_pmid_routes_to_pubmed(self, capsys):
+    def test_pmid_routes_to_pubmed(self, capsys, cache_db):
         fake = CachedPaper(
             title="T",
             authors=[CachedAuthor("A")],
@@ -1117,7 +1156,7 @@ class TestCmdBibPubmed:
         categories=["Nature"],
     )
 
-    def test_pmid_uses_crossref_when_doi_present(self, capsys):
+    def test_pmid_uses_crossref_when_doi_present(self, capsys, cache_db):
         with patch("arxiv_tool._fetch_paper_pubmed", return_value=self.PUBMED_PAPER), \
              patch("arxiv_tool.fetch_bibtex_crossref", return_value="@article{cr,title={X}}") as mock_cr:
             args = argparse.Namespace(arxiv_id="39876543", output=None)
@@ -1125,7 +1164,7 @@ class TestCmdBibPubmed:
         mock_cr.assert_called_once_with("10.1038/foo")
         assert "@article{cr" in capsys.readouterr().out
 
-    def test_pmid_falls_back_when_crossref_returns_none(self, capsys):
+    def test_pmid_falls_back_when_crossref_returns_none(self, capsys, cache_db):
         with patch("arxiv_tool._fetch_paper_pubmed", return_value=self.PUBMED_PAPER), \
              patch("arxiv_tool.fetch_bibtex_crossref", return_value=None):
             args = argparse.Namespace(arxiv_id="39876543", output=None)
@@ -1137,7 +1176,7 @@ class TestCmdBibPubmed:
         assert "journal={Nature}" in out
         assert "year={2024}" in out
 
-    def test_pmid_skips_crossref_when_no_doi(self):
+    def test_pmid_skips_crossref_when_no_doi(self, cache_db):
         no_doi = CachedPaper(title="X", authors=[CachedAuthor("Author A")], pmid="123", year=2024)
         with patch("arxiv_tool._fetch_paper_pubmed", return_value=no_doi), \
              patch("arxiv_tool.fetch_bibtex_crossref") as mock_cr:
@@ -1145,11 +1184,24 @@ class TestCmdBibPubmed:
             arxiv_tool.cmd_bib(args)
         mock_cr.assert_not_called()
 
-    def test_pmid_not_found_exits(self):
+    def test_pmid_not_found_exits(self, cache_db):
         with patch("arxiv_tool._fetch_paper_pubmed", return_value=None):
             args = argparse.Namespace(arxiv_id="39876543", output=None)
             with pytest.raises(SystemExit):
                 arxiv_tool.cmd_bib(args)
+
+    def test_pmid_bib_uses_cache_on_second_call(self, cache_db):
+        """Once bib has rendered + cached a BibTeX entry, the second call must
+        not touch _fetch_paper_pubmed or Crossref."""
+        with patch("arxiv_tool._fetch_paper_pubmed", return_value=self.PUBMED_PAPER), \
+             patch("arxiv_tool.fetch_bibtex_crossref", return_value="@article{cr,...}"):
+            args = argparse.Namespace(arxiv_id="39876543", output=None)
+            arxiv_tool.cmd_bib(args)
+        with patch("arxiv_tool._fetch_paper_pubmed") as mock_pm, \
+             patch("arxiv_tool.fetch_bibtex_crossref") as mock_cr:
+            arxiv_tool.cmd_bib(args)
+            mock_pm.assert_not_called()
+            mock_cr.assert_not_called()
 
 
 class TestGenerateBibtexPubmed:

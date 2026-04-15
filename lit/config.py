@@ -21,6 +21,7 @@ CONTACT_EMAIL: str = os.environ.get("CONTACT_EMAIL", "")
 S2_API_BASE = "https://api.semanticscholar.org/graph/v1"
 OPENALEX_API_BASE = "https://api.openalex.org"
 PUBMED_API_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+EUROPEPMC_API_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 
 _mailto = f" (mailto:{CONTACT_EMAIL})" if CONTACT_EMAIL else ""
 HTTP_HEADERS = {

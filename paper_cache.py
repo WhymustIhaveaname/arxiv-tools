@@ -69,11 +69,35 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE papers DROP COLUMN published")
     if "updated" in cols:
         conn.execute("ALTER TABLE papers DROP COLUMN updated")
-    # Add nullable cross-reference columns on older databases.
     cols = {row[1] for row in conn.execute("PRAGMA table_info(papers)")}
     for name, coltype in _NULLABLE_COLUMNS:
         if name not in cols:
             conn.execute(f"ALTER TABLE papers ADD COLUMN {name} {coltype}")
+    # Cross-source PK: prefix any legacy bare IDs (e.g. "1706.03762") with "arxiv:"
+    # so they don't collide with future "pmid:39876543" / "doi:10.x/y" entries.
+    rows = conn.execute(
+        "SELECT arxiv_id FROM papers WHERE arxiv_id NOT LIKE '%:%'"
+    ).fetchall()
+    for (old_id,) in rows:
+        new_id = f"arxiv:{old_id}"
+        try:
+            conn.execute(
+                "UPDATE papers SET arxiv_id = ? WHERE arxiv_id = ?",
+                (new_id, old_id),
+            )
+        except sqlite3.IntegrityError:
+            # The prefixed key already exists (rare); drop the legacy duplicate.
+            conn.execute("DELETE FROM papers WHERE arxiv_id = ?", (old_id,))
+
+
+def _normalize_paper_id(raw: str) -> str:
+    """Canonicalise a paper key.
+
+    Accepts either a bare arXiv ID (legacy) or a prefixed cross-source ID
+    (``arxiv:1706.03762`` / ``pmid:39876543`` / ``doi:10.x/y``). Bare values
+    get an ``arxiv:`` prefix so all rows live in one keyspace.
+    """
+    return raw if ":" in raw else f"arxiv:{raw}"
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -90,7 +114,7 @@ def get_cached_paper(arxiv_id: str) -> CachedPaper | None:
         row = conn.execute(
             "SELECT title, authors, abstract, categories, pdf_url, source, doi, pmid, pmcid "
             "FROM papers WHERE arxiv_id = ?",
-            (arxiv_id,),
+            (_normalize_paper_id(arxiv_id),),
         ).fetchone()
         if row is None:
             return None
@@ -120,7 +144,7 @@ def cache_paper(arxiv_id: str, paper: CachedPaper, bibtex: str) -> None:
                     cached_at, source, doi, pmid, pmcid)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    arxiv_id,
+                    _normalize_paper_id(arxiv_id),
                     paper.title,
                     json.dumps([a.name for a in paper.authors]),
                     paper.abstract,
@@ -143,7 +167,7 @@ def get_cached_bibtex(arxiv_id: str) -> str | None:
     try:
         row = conn.execute(
             "SELECT bibtex FROM papers WHERE arxiv_id = ?",
-            (arxiv_id,),
+            (_normalize_paper_id(arxiv_id),),
         ).fetchone()
         return row[0] if row else None
     finally:

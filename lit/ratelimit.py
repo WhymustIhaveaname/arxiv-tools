@@ -40,6 +40,8 @@ class RateLimiter:
         "pubmed": 0.35,
         # Crossref polite pool (with mailto) is ~50 req/s; 0.05s is a safe cap.
         "crossref": 0.05,
+        # Europe PMC: 10 req/s on REST endpoints.
+        "europepmc": 0.1,
         "ut": 0.3,
     }
 

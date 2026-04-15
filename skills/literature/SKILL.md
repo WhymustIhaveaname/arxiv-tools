@@ -59,14 +59,16 @@ S2 bulk search (up to 1000 results, supports sorting and pagination):
 
 ```bash
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info <arXiv ID>
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info <PMID>          # PubMed
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info <PMID>             # PubMed
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info <PMC ID>           # e.g. PMC7610144 — auto-resolved to PMID via ELink
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info <DOI>              # e.g. 10.1038/s41586-020-2649-2 — resolved via OpenAlex
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info https://pubmed.ncbi.nlm.nih.gov/39876543/
 ```
 
-ID type is auto-detected (arXiv ID, PMID, PMID URL, arXiv URL). DOI / PMC ID
-dispatch is being added.
+ID type is auto-detected: arXiv ID / URL, PMID, PMC ID, DOI (bare or
+https://doi.org/...), or ncbi URLs.
 
-### tex — download full paper source
+### tex — download LaTeX source (arXiv only)
 
 ```bash
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" tex <arXiv ID>
@@ -74,20 +76,33 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" tex <arXiv ID>
 
 Downloads the tex source and returns the directory path and structure, preserving full LaTeX formatting and figures. If the source is unavailable, falls back to PDF download and text extraction.
 
-LaTeX source is only available for arXiv papers. For non-arXiv papers (bioRxiv, PubMed, etc.), a future `fulltext` subcommand will fetch PDF / JATS XML.
+### fulltext — download full text (any supported source)
+
+```bash
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fulltext <arXiv ID>  # LaTeX source + PDF fallback (same as `tex`)
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fulltext <PMID>      # ELink → PMC → JATS XML
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fulltext <PMC ID>    # Direct Europe PMC JATS XML
+```
+
+Dispatches by ID type:
+- arXiv → LaTeX source from arxiv.org/e-print + PDF text-extraction fallback
+- PMC ID → Europe PMC `/PMC/{id}/fullTextXML` (JATS XML for OA papers)
+- PMID → ELink resolves to PMC, then Europe PMC XML; exits if the paper has no OA full text
 
 ### bib — generate BibTeX citation
 
 ```bash
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <arXiv ID>
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <PMID>                        # PubMed
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <arXiv ID|PMID> -o refs.bib   # append to file
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <PMID>                  # PubMed
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <PMC ID>                # auto-resolved to PMID
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <DOI>                   # Crossref direct
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <ID> -o refs.bib        # append to file
 ```
 
-For PMIDs the tool first asks Crossref via DOI content negotiation
+For PMIDs / DOIs the tool first asks Crossref via DOI content negotiation
 (authoritative `@article` with journal/volume/issue/pages); on failure or
-when the paper has no DOI, it builds a minimal `@article` from EFetch
-metadata.
+when a PubMed paper has no DOI, it builds a minimal `@article` from EFetch
+metadata. Rendered BibTeX is cached per-ID so repeat calls are local.
 
 ### cited — reverse citation lookup
 
@@ -95,14 +110,16 @@ Find which papers cite a given paper.
 
 ```bash
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID>
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <PMID>                       # PubMed
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <PMID>               # PubMed
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <PMC ID>             # auto-resolved to PMID
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <DOI>                # via S2 DOI: accessor
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <ID> --max 50
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <ID> --offset 20             # pagination
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <ID> --offset 20     # pagination
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <ID> --source s2|openalex
 ```
 
-Both S2 and OpenAlex resolve PMIDs natively, so PMID-cited works the same
-way as arXiv-cited.
+S2 and OpenAlex both accept any of ArXiv:, PMID:, DOI: paper specs, so all
+ID types work the same way.
 
 ## Data source fallback
 

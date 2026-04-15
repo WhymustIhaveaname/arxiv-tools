@@ -57,14 +57,31 @@ def _search_openalex(query: str, max_results: int = 10) -> list[dict] | None:
     return data["results"][:max_results]
 
 
-def _fetch_paper_openalex(arxiv_id: str) -> CachedPaper | None:
-    doi = f"10.48550/arXiv.{arxiv_id}"
-    url = f"{OPENALEX_API_BASE}/works/doi:{doi}"
+def _openalex_url_for_spec(paper_spec: str) -> str | None:
+    """Map a generic paper_spec to the OpenAlex /works/{id} URL form."""
+    if paper_spec.startswith("ArXiv:"):
+        return f"{OPENALEX_API_BASE}/works/doi:10.48550/arXiv.{paper_spec[len('ArXiv:'):]}"
+    if paper_spec.startswith("PMID:"):
+        return f"{OPENALEX_API_BASE}/works/pmid:{paper_spec[len('PMID:'):]}"
+    if paper_spec.startswith("DOI:"):
+        return f"{OPENALEX_API_BASE}/works/doi:{paper_spec[len('DOI:'):]}"
+    return None
+
+
+def _fetch_paper_openalex_spec(paper_spec: str) -> CachedPaper | None:
+    """Fetch full metadata from OpenAlex by any paper_spec.
+
+    Returns a CachedPaper with title/authors/abstract/year and any
+    cross-reference IDs OpenAlex returns. ``source`` is set to "openalex".
+    """
+    url = _openalex_url_for_spec(paper_spec)
+    if url is None:
+        return None
     try:
         resp = _request_with_retry(
             requests.get, url, service="openalex",
             params=_openalex_params(
-                select="title,authorships,abstract_inverted_index",
+                select="title,authorships,abstract_inverted_index,publication_year,doi,ids,best_oa_location",
             ),
             timeout=15,
         )
@@ -83,12 +100,45 @@ def _fetch_paper_openalex(arxiv_id: str) -> CachedPaper | None:
 
     abstract = _reconstruct_abstract(data.get("abstract_inverted_index")) or ""
 
+    ids = data.get("ids") or {}
+    doi_field = data.get("doi") or ids.get("doi") or ""
+    if doi_field.startswith("https://doi.org/"):
+        doi_field = doi_field[len("https://doi.org/"):]
+
+    pmid_field = ids.get("pmid") or ""
+    if pmid_field.startswith("https://pubmed.ncbi.nlm.nih.gov/"):
+        pmid_field = pmid_field.rstrip("/").rsplit("/", 1)[-1]
+
+    pmcid_field = ids.get("pmcid") or ""
+    if "PMC" in pmcid_field:
+        pmcid_field = "PMC" + pmcid_field.split("PMC", 1)[1].rstrip("/")
+
+    pdf_url = ""
+    oa = data.get("best_oa_location") or {}
+    if oa.get("pdf_url"):
+        pdf_url = oa["pdf_url"]
+
     return CachedPaper(
         title=data["title"],
         authors=authors,
         abstract=abstract,
-        pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
+        pdf_url=pdf_url,
+        year=data.get("publication_year"),
+        source="openalex",
+        doi=doi_field or None,
+        pmid=pmid_field or None,
+        pmcid=pmcid_field or None,
     )
+
+
+def _fetch_paper_openalex(arxiv_id: str) -> CachedPaper | None:
+    """Back-compat wrapper for arXiv IDs."""
+    paper = _fetch_paper_openalex_spec(f"ArXiv:{arxiv_id}")
+    if paper is None:
+        return None
+    # Preserve the legacy pdf_url shape that the arxiv path expects.
+    paper.pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
+    return paper
 
 
 def _resolve_openalex_id_spec(paper_spec: str) -> tuple[str, str, int] | None:

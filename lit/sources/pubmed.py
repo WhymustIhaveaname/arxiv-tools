@@ -27,6 +27,75 @@ def _pubmed_params(**extra) -> dict[str, str]:
     return extra
 
 
+def pmid_to_pmcid(pmid: str) -> str | None:
+    """Resolve a PMID to its PMC ID (PMCxxxxx) via NCBI ELink.
+
+    Returns ``None`` when the PubMed paper has no OA full-text in PMC.
+    """
+    url = f"{PUBMED_API_BASE}/elink.fcgi"
+    try:
+        resp = _request_with_retry(
+            requests.get,
+            url,
+            service="pubmed",
+            params=_pubmed_params(
+                dbfrom="pubmed",
+                db="pmc",
+                id=pmid,
+                retmode="json",
+            ),
+            headers=HTTP_HEADERS,
+            timeout=15,
+        )
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"PubMed ELink failed: {_brief_error(e)}", file=sys.stderr)
+        return None
+
+    for ls in data.get("linksets") or []:
+        for ldb in ls.get("linksetdbs") or []:
+            if ldb.get("dbto") == "pmc":
+                links = ldb.get("links") or []
+                if links:
+                    return f"PMC{links[0]}"
+    return None
+
+
+def pmcid_to_pmid(pmcid: str) -> str | None:
+    """Resolve a PMC ID (e.g. ``PMC1234567``) to its PMID via NCBI ELink.
+
+    Returns ``None`` when the PMC paper has no linked PubMed record.
+    """
+    bare = pmcid[3:] if pmcid.upper().startswith("PMC") else pmcid
+    url = f"{PUBMED_API_BASE}/elink.fcgi"
+    try:
+        resp = _request_with_retry(
+            requests.get,
+            url,
+            service="pubmed",
+            params=_pubmed_params(
+                dbfrom="pmc",
+                db="pubmed",
+                id=bare,
+                retmode="json",
+            ),
+            headers=HTTP_HEADERS,
+            timeout=15,
+        )
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"PubMed ELink failed: {_brief_error(e)}", file=sys.stderr)
+        return None
+
+    for ls in data.get("linksets") or []:
+        for ldb in ls.get("linksetdbs") or []:
+            if ldb.get("dbto") == "pubmed":
+                links = ldb.get("links") or []
+                if links:
+                    return str(links[0])
+    return None
+
+
 def _esearch_pmids(query: str, max_results: int) -> list[str] | None:
     url = f"{PUBMED_API_BASE}/esearch.fcgi"
     try:
@@ -182,7 +251,10 @@ def _fetch_paper_pubmed(pmid: str) -> CachedPaper | None:
 
     doi = ""
     pmcid = ""
-    for aid in article.findall(".//ArticleIdList/ArticleId"):
+    # Pin the XPath to PubmedData/ArticleIdList — nested ArticleIdLists inside
+    # ReferenceList entries carry the *cited papers'* IDs, which would otherwise
+    # silently overwrite the main paper's metadata.
+    for aid in article.findall("./PubmedData/ArticleIdList/ArticleId"):
         id_type = (aid.get("IdType") or "").lower()
         value = (aid.text or "").strip()
         if id_type == "doi":

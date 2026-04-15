@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-import pytest
-
 from paper_cache import (
     CachedAuthor,
     CachedPaper,
@@ -23,14 +21,6 @@ MOCK_CACHED_PAPER = CachedPaper(
 )
 
 MOCK_BIBTEX = "@misc{vaswani2017attention,\n  title={Attention Is All You Need},\n}"
-
-
-@pytest.fixture()
-def cache_db(tmp_path):
-    """每个测试用独立的临时数据库"""
-    db_path = tmp_path / "test_cache.db"
-    with patch("paper_cache.DB_PATH", db_path):
-        yield db_path
 
 
 class TestCacheRoundtrip:

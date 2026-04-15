@@ -80,16 +80,20 @@ from lit.sources.arxiv_api import (
     _normalize_arxiv_search,
     search_papers,
 )
+from lit.sources.europepmc import fetch_pmc_fulltext_xml
 from lit.sources.pubmed import (
     _fetch_paper_pubmed,
     _normalize_pubmed_search,
     _search_pubmed,
+    pmcid_to_pmid,
+    pmid_to_pmcid,
     print_pubmed_info,
 )
 from lit.sources.openalex import (
     _fetch_citations_openalex,
     _fetch_citations_openalex_spec,
     _fetch_paper_openalex,
+    _fetch_paper_openalex_spec,
     _normalize_openalex_search,
     _openalex_params,
     _print_citations_openalex,
@@ -134,6 +138,58 @@ def get_paper_info(arxiv_id: str):
     bibtex = generate_bibtex(paper, clean_id)
     cache_paper(clean_id, paper, bibtex)
     return paper
+
+
+def get_paper_info_pubmed(pmid: str):
+    """Cache-aware PubMed metadata fetch.
+
+    Looks up ``pmid:<pmid>`` in the shared cache before hitting EFetch.
+    Cached entries write an empty bibtex; cmd_bib will fill it in on first call.
+    """
+    cache_key = f"pmid:{pmid}"
+    cached = get_cached_paper(cache_key)
+    if cached:
+        return cached
+
+    paper = _fetch_paper_pubmed(pmid)
+    if not paper:
+        return None
+
+    cache_paper(cache_key, paper, "")
+    return paper
+
+
+def get_paper_info_doi(doi: str):
+    """Cache-aware DOI metadata fetch via OpenAlex (the freest source that
+    natively resolves DOIs and reconstructs abstracts).
+    """
+    cache_key = f"doi:{doi.lower()}"
+    cached = get_cached_paper(cache_key)
+    if cached:
+        return cached
+
+    paper = _fetch_paper_openalex_spec(f"DOI:{doi}")
+    if not paper:
+        return None
+
+    cache_paper(cache_key, paper, "")
+    return paper
+
+
+def _print_doi_info(doi: str, paper) -> None:
+    print(f"DOI: {doi}")
+    print(f"Title: {paper.title}")
+    print(f"Authors: {', '.join(a.name for a in paper.authors)}")
+    if paper.year:
+        print(f"Year: {paper.year}")
+    if paper.pmid:
+        print(f"PMID: {paper.pmid}")
+    if paper.pmcid:
+        print(f"PMC: {paper.pmcid}")
+    if paper.pdf_url:
+        print(f"PDF: {paper.pdf_url}")
+    if paper.abstract:
+        print(f"\nAbstract:\n{paper.abstract}")
 
 
 def _print_search_results(results: list[dict]) -> None:
@@ -228,21 +284,42 @@ def cmd_search(args):
     _print_search_results(normalized)
 
 
+def _resolve_pmcid_or_die(pmcid: str) -> str:
+    pmid = pmcid_to_pmid(pmcid)
+    if not pmid:
+        print(f"Could not resolve {pmcid} to a PMID via NCBI ELink.", file=sys.stderr)
+        sys.exit(1)
+    print(f"Resolved {pmcid} → PMID:{pmid}", file=sys.stderr)
+    return pmid
+
+
 def cmd_info(args):
     id_type, clean_id = extract_paper_id(args.arxiv_id)
 
+    if id_type == "pmcid":
+        clean_id = _resolve_pmcid_or_die(clean_id)
+        id_type = "pmid"
+
     if id_type == "pmid":
-        paper = _fetch_paper_pubmed(clean_id)
+        paper = get_paper_info_pubmed(clean_id)
         if not paper:
             print(f"Paper not found: PMID:{clean_id}", file=sys.stderr)
             return
         print_pubmed_info(clean_id, paper)
         return
 
+    if id_type == "doi":
+        paper = get_paper_info_doi(clean_id)
+        if not paper:
+            print(f"Paper not found: DOI:{clean_id}", file=sys.stderr)
+            return
+        _print_doi_info(clean_id, paper)
+        return
+
     if id_type != "arxiv":
         print(
-            f"Unrecognised identifier '{args.arxiv_id}' — currently `info` supports "
-            f"arXiv IDs and PMIDs.",
+            f"Unrecognised identifier '{args.arxiv_id}' — supported: arXiv ID, "
+            f"PMID, PMC ID, DOI.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -280,23 +357,54 @@ def _write_bibtex(bibtex: str, output: str | None) -> None:
 
 def _bib_for_pmid(pmid: str) -> str | None:
     """Fetch PubMed metadata then try Crossref (via DOI) before falling back
-    to a locally-built @article entry.
+    to a locally-built @article entry. Bibtex is cached after first render.
     """
-    paper = _fetch_paper_pubmed(pmid)
+    cache_key = f"pmid:{pmid}"
+    cached_bib = get_cached_bibtex(cache_key)
+    if cached_bib:
+        return cached_bib
+
+    paper = get_paper_info_pubmed(pmid)
     if not paper:
         print(f"Paper not found: PMID:{pmid}", file=sys.stderr)
         return None
 
+    bibtex = None
     if paper.doi:
-        crossref_bib = fetch_bibtex_crossref(paper.doi)
-        if crossref_bib:
-            return crossref_bib
+        bibtex = fetch_bibtex_crossref(paper.doi)
+    if not bibtex:
+        bibtex = generate_bibtex_pubmed(paper, pmid)
 
-    return generate_bibtex_pubmed(paper, pmid)
+    cache_paper(cache_key, paper, bibtex)
+    return bibtex
+
+
+def _bib_for_doi(doi: str) -> str | None:
+    """Crossref content negotiation for DOIs. Cached on first success."""
+    cache_key = f"doi:{doi.lower()}"
+    cached_bib = get_cached_bibtex(cache_key)
+    if cached_bib:
+        return cached_bib
+
+    bibtex = fetch_bibtex_crossref(doi)
+    if not bibtex:
+        return None
+
+    paper = get_paper_info_doi(doi)
+    if paper is None:
+        # Cache key didn't get populated by get_paper_info_doi; fabricate a
+        # minimal CachedPaper so the bibtex still survives the round trip.
+        paper = CachedPaper(title="", authors=[], doi=doi, source="crossref")
+    cache_paper(cache_key, paper, bibtex)
+    return bibtex
 
 
 def cmd_bib(args):
     id_type, clean_id = extract_paper_id(args.arxiv_id)
+
+    if id_type == "pmcid":
+        clean_id = _resolve_pmcid_or_die(clean_id)
+        id_type = "pmid"
 
     if id_type == "pmid":
         bibtex = _bib_for_pmid(clean_id)
@@ -305,10 +413,18 @@ def cmd_bib(args):
         _write_bibtex(bibtex, args.output)
         return
 
+    if id_type == "doi":
+        bibtex = _bib_for_doi(clean_id)
+        if not bibtex:
+            print(f"Could not fetch BibTeX for DOI:{clean_id}", file=sys.stderr)
+            sys.exit(1)
+        _write_bibtex(bibtex, args.output)
+        return
+
     if id_type != "arxiv":
         print(
-            f"Unrecognised identifier '{args.arxiv_id}' — currently `bib` supports "
-            f"arXiv IDs and PMIDs.",
+            f"Unrecognised identifier '{args.arxiv_id}' — supported: arXiv ID, "
+            f"PMID, PMC ID, DOI.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -326,16 +442,24 @@ def cmd_bib(args):
 
 def cmd_cited(args):
     id_type, clean_id = extract_paper_id(args.arxiv_id)
+
+    if id_type == "pmcid":
+        clean_id = _resolve_pmcid_or_die(clean_id)
+        id_type = "pmid"
+
     if id_type == "arxiv":
         paper_spec = f"ArXiv:{clean_id}"
         display_id = f"arXiv:{clean_id}"
     elif id_type == "pmid":
         paper_spec = f"PMID:{clean_id}"
         display_id = f"PMID:{clean_id}"
+    elif id_type == "doi":
+        paper_spec = f"DOI:{clean_id}"
+        display_id = f"DOI:{clean_id}"
     else:
         print(
-            f"Unrecognised identifier '{args.arxiv_id}' — currently `cited` supports "
-            f"arXiv IDs and PMIDs.",
+            f"Unrecognised identifier '{args.arxiv_id}' — supported: arXiv ID, "
+            f"PMID, PMC ID, DOI.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -388,6 +512,64 @@ def cmd_tex(args):
     else:
         print("\ntex download failed, falling back to PDF...", file=sys.stderr)
         _fetch_pdf_fallback(args.arxiv_id, OUTPUT_DIR)
+
+
+def _fetch_pmc_to_disk(pmcid: str) -> None:
+    out_path = OUTPUT_DIR / f"{pmcid.upper()}.xml"
+    if out_path.exists():
+        print(f"Already exists: {out_path}")
+        return
+    print(f"Downloading PMC full-text XML: {pmcid}")
+    xml = fetch_pmc_fulltext_xml(pmcid)
+    if not xml:
+        print(
+            f"\nNo OA full-text for {pmcid} on Europe PMC. The paper may be "
+            f"closed access or not yet indexed.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(xml, encoding="utf-8")
+    print(f"Saved: {out_path} ({len(xml):,} bytes)")
+
+
+def cmd_fulltext(args):
+    """Dispatch full-text fetch by ID type:
+
+    - arxiv → existing tex source download (LaTeX, with PDF/text fallback)
+    - pmcid → Europe PMC JATS XML
+    - pmid  → ELink PMID → PMC ID → JATS XML
+    """
+    id_type, clean_id = extract_paper_id(args.arxiv_id)
+
+    if id_type == "arxiv":
+        cmd_tex(argparse.Namespace(arxiv_id=clean_id))
+        return
+
+    if id_type == "pmcid":
+        _fetch_pmc_to_disk(clean_id)
+        return
+
+    if id_type == "pmid":
+        # Cached metadata may already carry a pmcid; otherwise ask NCBI directly.
+        paper = get_paper_info_pubmed(clean_id)
+        pmcid = paper.pmcid if paper and paper.pmcid else pmid_to_pmcid(clean_id)
+        if not pmcid:
+            print(
+                f"\nPMID:{clean_id} has no associated PMC full-text. "
+                f"Closed-access papers cannot be downloaded.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        _fetch_pmc_to_disk(pmcid)
+        return
+
+    print(
+        f"Unrecognised identifier '{args.arxiv_id}' — `fulltext` supports "
+        f"arXiv ID, PMID, and PMC ID.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def main():
@@ -453,9 +635,15 @@ def main():
     )
     cited_parser.set_defaults(func=cmd_cited)
 
-    tex_parser = subparsers.add_parser("tex", help="下载 LaTeX 源文件并解压")
+    tex_parser = subparsers.add_parser("tex", help="下载 LaTeX 源文件并解压 (arXiv 专用)")
     tex_parser.add_argument("arxiv_id", help="arXiv ID")
     tex_parser.set_defaults(func=cmd_tex)
+
+    fulltext_parser = subparsers.add_parser(
+        "fulltext", help="下载全文：arXiv 走 LaTeX/PDF, PMC 走 JATS XML"
+    )
+    fulltext_parser.add_argument("arxiv_id", help="arXiv ID / PMID / PMC ID")
+    fulltext_parser.set_defaults(func=cmd_fulltext)
 
     args = parser.parse_args()
     try:
