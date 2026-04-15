@@ -1,0 +1,224 @@
+"""Semantic Scholar adapter: search, bulk search, paper lookup, citations."""
+
+from __future__ import annotations
+
+import sys
+
+import requests
+
+from lit.config import HTTP_HEADERS, S2_API_BASE, S2_API_KEY
+from lit.ids import _arxiv_date, _truncate_authors
+from lit.ratelimit import _brief_error, _request_with_retry
+from paper_cache import CachedAuthor, CachedPaper
+
+
+def _s2_headers() -> dict[str, str]:
+    if S2_API_KEY:
+        return {**HTTP_HEADERS, "x-api-key": S2_API_KEY}
+    return HTTP_HEADERS
+
+
+def _s2_search_params(
+    query: str,
+    max_results: int,
+    *,
+    year: str | None = None,
+    fields_of_study: str | None = None,
+    publication_types: str | None = None,
+    min_citations: int | None = None,
+    venue: str | None = None,
+    open_access: bool = False,
+) -> dict:
+    """Build S2 search params (shared between /paper/search and /paper/search/bulk)."""
+    params: dict = {
+        "query": query,
+        "limit": min(max_results, 100),
+        "fields": "title,year,authors,externalIds,citationCount,abstract",
+    }
+    if year:
+        params["year"] = year
+    if fields_of_study:
+        params["fieldsOfStudy"] = fields_of_study
+    if publication_types:
+        params["publicationTypes"] = publication_types
+    if min_citations is not None:
+        params["minCitationCount"] = str(min_citations)
+    if venue:
+        params["venue"] = venue
+    if open_access:
+        params["openAccessPdf"] = ""
+    return params
+
+
+def _search_s2(query: str, max_results: int = 10, **filters) -> list[dict] | None:
+    params = _s2_search_params(query, max_results, **filters)
+    try:
+        resp = _request_with_retry(
+            requests.get,
+            f"{S2_API_BASE}/paper/search",
+            service="s2",
+            params=params,
+            headers=_s2_headers(),
+            timeout=30,
+        )
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"Semantic Scholar search failed: {_brief_error(e)}", file=sys.stderr)
+        return None
+
+    if not data.get("data"):
+        return None
+    return data["data"][:max_results]
+
+
+def _search_s2_bulk(
+    query: str,
+    max_results: int = 100,
+    token: str | None = None,
+    sort: str | None = None,
+    **filters,
+) -> tuple[list[dict], str | None] | None:
+    """Bulk search (up to 10M results via token pagination, 1000/page)."""
+    params = _s2_search_params(query, min(max_results, 1000), **filters)
+    if token:
+        params["token"] = token
+    if sort:
+        params["sort"] = sort
+    try:
+        resp = _request_with_retry(
+            requests.get,
+            f"{S2_API_BASE}/paper/search/bulk",
+            service="s2",
+            params=params,
+            headers=_s2_headers(),
+            timeout=30,
+        )
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"Semantic Scholar bulk search failed: {_brief_error(e)}", file=sys.stderr)
+        return None
+
+    if not data.get("data"):
+        return None
+    return data["data"][:max_results], data.get("token")
+
+
+def _fetch_paper_s2(arxiv_id: str) -> CachedPaper | None:
+    """Fetch paper metadata from Semantic Scholar by arXiv ID."""
+    url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}"
+    try:
+        resp = _request_with_retry(
+            requests.get, url, service="s2",
+            params={"fields": "title,authors,abstract"},
+            headers=_s2_headers(),
+            timeout=15,
+        )
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"S2 lookup failed: {_brief_error(e)}", file=sys.stderr)
+        return None
+
+    if not data.get("title") or not data.get("authors"):
+        return None
+
+    published = _arxiv_date(arxiv_id)
+    if not published:
+        return None
+
+    return CachedPaper(
+        title=data["title"],
+        authors=[CachedAuthor(a["name"]) for a in data["authors"]],
+        abstract=data.get("abstract") or "",
+        pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
+    )
+
+
+def _fetch_citations_s2(
+    arxiv_id: str, max_results: int, offset: int = 0
+) -> tuple[list[dict], int] | None:
+    info_url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}"
+    try:
+        resp = _request_with_retry(
+            requests.get,
+            info_url,
+            service="s2",
+            params={"fields": "title,citationCount"},
+            headers=_s2_headers(),
+            timeout=30,
+        )
+        paper_info = resp.json()
+        print(f"Paper: {paper_info['title']}")
+        print(f"Total citations: {paper_info['citationCount']}")
+    except requests.RequestException as e:
+        print(f"Semantic Scholar query failed: {_brief_error(e)}", file=sys.stderr)
+        return None
+
+    citations_url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}/citations"
+    try:
+        resp = _request_with_retry(
+            requests.get,
+            citations_url,
+            service="s2",
+            params={
+                "fields": "title,year,externalIds,citationCount,authors",
+                "offset": offset,
+                "limit": min(max_results, 1000),
+            },
+            headers=_s2_headers(),
+            timeout=30,
+        )
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"Semantic Scholar citations fetch failed: {_brief_error(e)}", file=sys.stderr)
+        return None
+
+    results = [
+        item["citingPaper"] for item in data["data"] if item["citingPaper"]["title"]
+    ]
+    return results[:max_results], paper_info["citationCount"]
+
+
+def _normalize_s2_search(results: list[dict]) -> list[dict]:
+    out = []
+    for paper in results:
+        ext_ids = paper["externalIds"] or {}
+        arxiv_id = ext_ids.get("ArXiv", "")
+        doi = ext_ids.get("DOI", "")
+        if arxiv_id:
+            id_str = f"arXiv:{arxiv_id}"
+        elif doi:
+            id_str = f"DOI:{doi}"
+        else:
+            id_str = ""
+
+        authors = paper["authors"] or []
+        author_str = _truncate_authors([a["name"] for a in authors])
+
+        out.append(
+            {
+                "id": id_str,
+                "title": paper["title"],
+                "authors": author_str,
+                "year": str(paper["year"] or "?"),
+                "cited_by": paper["citationCount"],
+                "abstract": paper["abstract"],
+            }
+        )
+    return out
+
+
+def _print_citations_s2(results: list[dict], start: int = 1) -> None:
+    for i, paper in enumerate(results, start):
+        ext_ids = paper["externalIds"] or {}
+        arxiv_ext = ext_ids.get("ArXiv")
+        arxiv_str = f"  arXiv:{arxiv_ext}" if arxiv_ext else ""
+
+        authors = paper["authors"] or []
+        author_str = _truncate_authors([a["name"] for a in authors])
+
+        print(f"[{i}] {paper['title']}")
+        print(f"    Authors: {author_str}")
+        print(
+            f"    Year: {paper['year'] or '?'}  Cited: {paper['citationCount']}{arxiv_str}"
+        )
+        print()

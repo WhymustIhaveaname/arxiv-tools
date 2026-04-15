@@ -628,8 +628,10 @@ class TestFetchTexSourceFailure:
 
     def test_extraction_failure_cleans_up(self, tmp_path):
         """解压失败时清理已创建的目录"""
-        with patch("arxiv_tool._extract_source", side_effect=RuntimeError("bad archive")):
-            with patch("arxiv_tool.requests.get") as mock_get:
+        # _extract_source lives in lit.fulltext after the refactor; fetch_tex_source
+        # looks it up from its own module, so patch must target that namespace.
+        with patch("lit.fulltext._extract_source", side_effect=RuntimeError("bad archive")):
+            with patch("lit.fulltext.requests.get") as mock_get:
                 mock_resp = mock_get.return_value
                 mock_resp.raise_for_status = lambda: None
                 mock_resp.content = b"fake content"
