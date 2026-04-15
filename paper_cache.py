@@ -1,4 +1,4 @@
-"""论文元数据 SQLite 缓存"""
+"""Paper metadata SQLite cache."""
 
 from __future__ import annotations
 
@@ -22,8 +22,21 @@ CREATE TABLE IF NOT EXISTS papers (
     categories TEXT NOT NULL DEFAULT '[]',
     pdf_url    TEXT NOT NULL DEFAULT '',
     bibtex     TEXT NOT NULL,
-    cached_at  TEXT NOT NULL
+    cached_at  TEXT NOT NULL,
+    source     TEXT,
+    doi        TEXT,
+    pmid       TEXT,
+    pmcid      TEXT
 )"""
+
+# Columns added after the initial schema; checked on every connection and
+# ALTER TABLE'd in if missing. Keep in sync with _CREATE_TABLE_SQL.
+_NULLABLE_COLUMNS = [
+    ("source", "TEXT"),
+    ("doi", "TEXT"),
+    ("pmid", "TEXT"),
+    ("pmcid", "TEXT"),
+]
 
 
 @dataclass
@@ -38,10 +51,14 @@ class CachedPaper:
     abstract: str = ""
     categories: list[str] = field(default_factory=list)
     pdf_url: str = ""
+    source: str | None = None
+    doi: str | None = None
+    pmid: str | None = None
+    pmcid: str | None = None
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Migrate old schema"""
+    """Migrate legacy schemas in place."""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(papers)")}
     if not cols:
         return
@@ -51,6 +68,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE papers DROP COLUMN published")
     if "updated" in cols:
         conn.execute("ALTER TABLE papers DROP COLUMN updated")
+    # Add nullable cross-reference columns on older databases.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(papers)")}
+    for name, coltype in _NULLABLE_COLUMNS:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE papers ADD COLUMN {name} {coltype}")
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -65,18 +87,23 @@ def get_cached_paper(arxiv_id: str) -> CachedPaper | None:
     conn = _get_conn()
     try:
         row = conn.execute(
-            "SELECT title, authors, abstract, categories, pdf_url FROM papers WHERE arxiv_id = ?",
+            "SELECT title, authors, abstract, categories, pdf_url, source, doi, pmid, pmcid "
+            "FROM papers WHERE arxiv_id = ?",
             (arxiv_id,),
         ).fetchone()
         if row is None:
             return None
-        title, authors_json, abstract, categories_json, pdf_url = row
+        title, authors_json, abstract, categories_json, pdf_url, source, doi, pmid, pmcid = row
         return CachedPaper(
             title=title,
             authors=[CachedAuthor(name) for name in json.loads(authors_json)],
             abstract=abstract,
             categories=json.loads(categories_json),
             pdf_url=pdf_url,
+            source=source,
+            doi=doi,
+            pmid=pmid,
+            pmcid=pmcid,
         )
     finally:
         conn.close()
@@ -88,8 +115,9 @@ def cache_paper(arxiv_id: str, paper: CachedPaper, bibtex: str) -> None:
         with conn:
             conn.execute(
                 """INSERT OR REPLACE INTO papers
-                   (arxiv_id, title, authors, abstract, categories, pdf_url, bibtex, cached_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (arxiv_id, title, authors, abstract, categories, pdf_url, bibtex,
+                    cached_at, source, doi, pmid, pmcid)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     arxiv_id,
                     paper.title,
@@ -99,6 +127,10 @@ def cache_paper(arxiv_id: str, paper: CachedPaper, bibtex: str) -> None:
                     paper.pdf_url,
                     bibtex,
                     datetime.now().isoformat(),
+                    paper.source,
+                    paper.doi,
+                    paper.pmid,
+                    paper.pmcid,
                 ),
             )
     finally:

@@ -56,6 +56,32 @@ class TestCacheRoundtrip:
     def test_bibtex_miss_returns_none(self, cache_db):
         assert get_cached_bibtex("9999.99999") is None
 
+    def test_stores_cross_reference_ids(self, cache_db):
+        """New nullable columns (source/doi/pmid/pmcid) round-trip."""
+        paper = CachedPaper(
+            title="Crossref paper",
+            authors=[CachedAuthor("Author")],
+            source="pubmed",
+            doi="10.1038/s41586-020-2649-2",
+            pmid="32649874",
+            pmcid="PMC7610144",
+        )
+        cache_paper("pm:32649874", paper, "@article{x}")
+        got = get_cached_paper("pm:32649874")
+        assert got.source == "pubmed"
+        assert got.doi == "10.1038/s41586-020-2649-2"
+        assert got.pmid == "32649874"
+        assert got.pmcid == "PMC7610144"
+
+    def test_legacy_paper_has_null_cross_references(self, cache_db):
+        """Papers cached without cross-ref fields read back as None."""
+        cache_paper("1706.03762", MOCK_CACHED_PAPER, MOCK_BIBTEX)
+        got = get_cached_paper("1706.03762")
+        assert got.source is None
+        assert got.doi is None
+        assert got.pmid is None
+        assert got.pmcid is None
+
     def test_replace_on_duplicate(self, cache_db):
         cache_paper("1706.03762", MOCK_CACHED_PAPER, MOCK_BIBTEX)
 
