@@ -35,6 +35,9 @@ class RateLimiter:
         "s2": 2.0,
         "arxiv": 5.0,
         "openalex": 0.1,
+        # NCBI E-utilities: 3 req/s without an API key, 10 req/s with one.
+        # 0.35s keeps us safely under the no-key limit; with a key we're still OK.
+        "pubmed": 0.35,
         "ut": 0.3,
     }
 

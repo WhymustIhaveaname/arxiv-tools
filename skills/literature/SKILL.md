@@ -31,10 +31,10 @@ Script dependencies are declared in inline metadata at the top of the file — y
 ```bash
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "keywords"
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "keywords" --max 10
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "keywords" --source s2|openalex|arxiv
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "keywords" --source s2|openalex|arxiv|pubmed
 ```
 
-Works across all fields — S2 and OpenAlex cover chemistry, biology, medicine, physics, etc.
+Works across all fields — S2 and OpenAlex cover chemistry, biology, medicine, physics, etc. For dedicated biomedical search (MeSH terms, clinical results), use `--source pubmed`.
 
 S2-specific filter parameters:
 
@@ -59,9 +59,12 @@ S2 bulk search (up to 1000 results, supports sorting and pagination):
 
 ```bash
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info <arXiv ID>
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info <PMID>          # PubMed
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info https://pubmed.ncbi.nlm.nih.gov/39876543/
 ```
 
-Currently accepts arXiv IDs. DOI / PMID / PMC ID support is being added.
+ID type is auto-detected (arXiv ID, PMID, PMID URL, arXiv URL). DOI / PMC ID
+dispatch is being added.
 
 ### tex — download full paper source
 

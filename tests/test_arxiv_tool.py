@@ -24,6 +24,7 @@ import pytest
 import requests
 
 import arxiv_tool
+from paper_cache import CachedAuthor, CachedPaper
 
 # ── 测试用论文 ──────────────────────────────────────────────────────
 
@@ -107,6 +108,49 @@ class TestExtractArxivId:
 
     def test_passthrough_garbage(self):
         assert arxiv_tool.extract_arxiv_id("not-an-id") == "not-an-id"
+
+
+class TestExtractPaperId:
+    """Generic paper ID classification."""
+
+    def test_bare_arxiv_new(self):
+        assert arxiv_tool.extract_paper_id("2401.12345") == ("arxiv", "2401.12345")
+
+    def test_bare_arxiv_with_version(self):
+        assert arxiv_tool.extract_paper_id("1706.03762v5") == ("arxiv", "1706.03762")
+
+    def test_arxiv_prefix(self):
+        assert arxiv_tool.extract_paper_id("arXiv:2401.12345") == ("arxiv", "2401.12345")
+
+    def test_arxiv_url(self):
+        assert arxiv_tool.extract_paper_id("https://arxiv.org/abs/2401.12345v2") == ("arxiv", "2401.12345")
+
+    def test_arxiv_old_format(self):
+        assert arxiv_tool.extract_paper_id("cs/0401001") == ("arxiv", "cs/0401001")
+
+    def test_pmid_bare(self):
+        assert arxiv_tool.extract_paper_id("39876543") == ("pmid", "39876543")
+
+    def test_pmid_url(self):
+        assert arxiv_tool.extract_paper_id("https://pubmed.ncbi.nlm.nih.gov/39876543/") == ("pmid", "39876543")
+
+    def test_pmcid_bare(self):
+        assert arxiv_tool.extract_paper_id("PMC1234567") == ("pmcid", "PMC1234567")
+
+    def test_pmcid_lowercase(self):
+        assert arxiv_tool.extract_paper_id("pmc1234567") == ("pmcid", "PMC1234567")
+
+    def test_pmcid_url(self):
+        assert arxiv_tool.extract_paper_id("https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/") == ("pmcid", "PMC1234567")
+
+    def test_doi_bare(self):
+        assert arxiv_tool.extract_paper_id("10.1038/s41586-020-2649-2") == ("doi", "10.1038/s41586-020-2649-2")
+
+    def test_doi_url(self):
+        assert arxiv_tool.extract_paper_id("https://doi.org/10.1038/xxx") == ("doi", "10.1038/xxx")
+
+    def test_unknown_falls_through(self):
+        assert arxiv_tool.extract_paper_id("random keyword search") == ("unknown", "random keyword search")
 
 
 class TestSanitizeFilename:
@@ -462,6 +506,179 @@ class TestNormalizeOpenAlexSearch:
         }]
         result = arxiv_tool._normalize_openalex_search(raw)
         assert result[0]["year"] == "?"
+
+
+class TestNormalizePubmedSearch:
+    """ESummary records → standard search dicts."""
+
+    def test_basic(self):
+        raw = [{
+            "uid": "39876543",
+            "title": "CRISPR in cancer",
+            "authors": [
+                {"name": "Smith J", "authtype": "Author"},
+                {"name": "Jones A", "authtype": "Author"},
+            ],
+            "pubdate": "2024 Jan 15",
+        }]
+        result = arxiv_tool._normalize_pubmed_search(raw)
+        assert result[0]["id"] == "PMID:39876543"
+        assert result[0]["title"] == "CRISPR in cancer"
+        assert result[0]["authors"] == "Smith J, Jones A"
+        assert result[0]["year"] == "2024"
+        assert result[0]["cited_by"] is None
+        assert result[0]["abstract"] is None
+
+    def test_more_than_3_authors_truncated(self):
+        raw = [{
+            "uid": "1",
+            "title": "T",
+            "authors": [
+                {"name": "A", "authtype": "Author"},
+                {"name": "B", "authtype": "Author"},
+                {"name": "C", "authtype": "Author"},
+                {"name": "D", "authtype": "Author"},
+            ],
+            "pubdate": "2024",
+        }]
+        result = arxiv_tool._normalize_pubmed_search(raw)
+        assert result[0]["authors"] == "A, B, C..."
+
+    def test_falls_back_to_epubdate(self):
+        raw = [{
+            "uid": "1", "title": "T", "authors": [],
+            "pubdate": "", "epubdate": "2023-06-01",
+        }]
+        result = arxiv_tool._normalize_pubmed_search(raw)
+        assert result[0]["year"] == "2023"
+
+    def test_missing_pubdate_is_question_mark(self):
+        raw = [{"uid": "1", "title": "T", "authors": []}]
+        result = arxiv_tool._normalize_pubmed_search(raw)
+        assert result[0]["year"] == "?"
+
+    def test_non_author_contributors_filtered_when_authors_present(self):
+        """ESummary may include editors/translators; prefer authors when present."""
+        raw = [{
+            "uid": "1",
+            "title": "T",
+            "authors": [
+                {"name": "Editor E", "authtype": "Editor"},
+                {"name": "Author A", "authtype": "Author"},
+            ],
+            "pubdate": "2024",
+        }]
+        result = arxiv_tool._normalize_pubmed_search(raw)
+        assert result[0]["authors"] == "Author A"
+
+
+class TestFetchPaperPubmedParsing:
+    """EFetch XML → CachedPaper."""
+
+    EFETCH_XML = b"""<?xml version="1.0"?>
+<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID>39876543</PMID>
+      <Article>
+        <Journal><Title>Nature</Title></Journal>
+        <ArticleTitle>CRISPR in cancer therapy</ArticleTitle>
+        <Abstract>
+          <AbstractText Label="BACKGROUND">Background text.</AbstractText>
+          <AbstractText Label="METHODS">Methods text.</AbstractText>
+        </Abstract>
+        <AuthorList>
+          <Author>
+            <LastName>Smith</LastName>
+            <ForeName>Jane</ForeName>
+          </Author>
+          <Author>
+            <LastName>Jones</LastName>
+            <ForeName>Bob</ForeName>
+          </Author>
+        </AuthorList>
+      </Article>
+    </MedlineCitation>
+    <PubmedData>
+      <ArticleIdList>
+        <ArticleId IdType="pubmed">39876543</ArticleId>
+        <ArticleId IdType="doi">10.1038/xxx</ArticleId>
+        <ArticleId IdType="pmc">PMC7654321</ArticleId>
+      </ArticleIdList>
+    </PubmedData>
+  </PubmedArticle>
+</PubmedArticleSet>"""
+
+    def _mock_resp(self, content):
+        class R:
+            pass
+        r = R()
+        r.content = content
+        r.raise_for_status = lambda: None
+        return r
+
+    def test_parses_full_xml(self):
+        with patch("lit.sources.pubmed._request_with_retry",
+                   return_value=self._mock_resp(self.EFETCH_XML)):
+            paper = arxiv_tool._fetch_paper_pubmed("39876543")
+        assert paper is not None
+        assert paper.title == "CRISPR in cancer therapy"
+        assert [a.name for a in paper.authors] == ["Jane Smith", "Bob Jones"]
+        assert "BACKGROUND: Background text." in paper.abstract
+        assert "METHODS: Methods text." in paper.abstract
+        assert paper.source == "pubmed"
+        assert paper.pmid == "39876543"
+        assert paper.doi == "10.1038/xxx"
+        assert paper.pmcid == "PMC7654321"
+        assert paper.categories == ["Nature"]
+        assert paper.pdf_url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC7654321/pdf/"
+
+    def test_no_article_returns_none(self):
+        empty = b"<?xml version='1.0'?><PubmedArticleSet></PubmedArticleSet>"
+        with patch("lit.sources.pubmed._request_with_retry",
+                   return_value=self._mock_resp(empty)):
+            paper = arxiv_tool._fetch_paper_pubmed("0")
+        assert paper is None
+
+
+class TestCmdInfoDispatch:
+    """cmd_info routes to the right source based on ID type."""
+
+    def _args(self, arxiv_id):
+        return argparse.Namespace(arxiv_id=arxiv_id)
+
+    def test_pmid_routes_to_pubmed(self, capsys):
+        fake = CachedPaper(
+            title="T",
+            authors=[CachedAuthor("A")],
+            abstract="abs",
+            source="pubmed",
+            pmid="123",
+            pdf_url="u",
+        )
+        with patch("arxiv_tool._fetch_paper_pubmed", return_value=fake) as mock_pm, \
+             patch("arxiv_tool.get_paper_info") as mock_arxiv:
+            arxiv_tool.cmd_info(self._args("39876543"))
+        mock_pm.assert_called_once_with("39876543")
+        mock_arxiv.assert_not_called()
+        out = capsys.readouterr().out
+        assert "PMID: 39876543" in out
+        assert "abs" in out
+
+    def test_arxiv_id_routes_to_existing_path(self):
+        with patch("arxiv_tool._fetch_paper_pubmed") as mock_pm, \
+             patch("arxiv_tool.get_paper_info", return_value=MOCK_PAPER) as mock_arxiv:
+            arxiv_tool.cmd_info(self._args("1706.03762"))
+        mock_pm.assert_not_called()
+        mock_arxiv.assert_called_once_with("1706.03762")
+
+    def test_unknown_id_exits_nonzero(self):
+        with patch("arxiv_tool._fetch_paper_pubmed") as mock_pm, \
+             patch("arxiv_tool.get_paper_info") as mock_arxiv:
+            with pytest.raises(SystemExit):
+                arxiv_tool.cmd_info(self._args("totally not an id"))
+        mock_pm.assert_not_called()
+        mock_arxiv.assert_not_called()
 
 
 # ════════════════════════════════════════════════════════════════════

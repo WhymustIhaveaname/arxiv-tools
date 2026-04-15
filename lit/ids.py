@@ -68,3 +68,56 @@ def _truncate_authors(names: list[str], limit: int = 3) -> str:
     if len(names) > limit:
         result += "..."
     return result
+
+
+def extract_paper_id(raw: str) -> tuple[str, str]:
+    """Classify an arbitrary paper identifier.
+
+    Returns (id_type, id_value) where id_type is one of:
+    - "arxiv"   — clean arXiv ID, version suffix stripped
+    - "pmid"    — PubMed numeric ID
+    - "pmcid"   — PMC ID (e.g. "PMC1234567")
+    - "doi"     — DOI string (no scheme/host prefix)
+    - "unknown" — free text, caller should treat as a search query
+
+    Recognises bare IDs, arxiv: / arXiv: / PMC prefixes, and URLs for
+    arxiv.org, doi.org, pubmed.ncbi.nlm.nih.gov, pmc.ncbi.nlm.nih.gov.
+    """
+    s = raw.strip()
+
+    if "arxiv.org" in s:
+        m = re.search(r"(\d{4}\.\d{4,5}(?:v\d+)?|[a-z-]+/\d{7})", s)
+        if m:
+            return ("arxiv", re.sub(r"v\d+$", "", m.group(1)))
+
+    m = re.search(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)", s)
+    if m:
+        return ("pmid", m.group(1))
+
+    m = re.search(r"pmc\.ncbi\.nlm\.nih\.gov/articles?/(PMC\d+)", s, re.IGNORECASE)
+    if m:
+        return ("pmcid", m.group(1).upper())
+
+    if s.lower().startswith("arxiv:"):
+        return ("arxiv", re.sub(r"v\d+$", "", s[6:]))
+
+    if re.match(r"^PMC\d+$", s, re.IGNORECASE):
+        return ("pmcid", s.upper())
+
+    for prefix in ("https://doi.org/", "http://doi.org/", "doi.org/"):
+        if s.lower().startswith(prefix):
+            return ("doi", s[len(prefix):])
+
+    if re.match(r"^10\.\d+/", s):
+        return ("doi", s)
+
+    if re.match(r"^\d{4}\.\d{4,5}(v\d+)?$", s):
+        return ("arxiv", re.sub(r"v\d+$", "", s))
+
+    if re.match(r"^[a-z-]+/\d{7}$", s):
+        return ("arxiv", s)
+
+    if re.match(r"^\d{7,9}$", s):
+        return ("pmid", s)
+
+    return ("unknown", s)

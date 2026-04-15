@@ -55,6 +55,7 @@ from lit.ids import (
     _arxiv_year,
     _truncate_authors,
     extract_arxiv_id,
+    extract_paper_id,
     sanitize_filename,
 )
 from lit.bibtex import STOPWORDS, generate_bibtex, generate_citation_key
@@ -72,6 +73,12 @@ from lit.sources.arxiv_api import (
     _fetch_paper_arxiv,
     _normalize_arxiv_search,
     search_papers,
+)
+from lit.sources.pubmed import (
+    _fetch_paper_pubmed,
+    _normalize_pubmed_search,
+    _search_pubmed,
+    print_pubmed_info,
 )
 from lit.sources.openalex import (
     _fetch_citations_openalex,
@@ -155,6 +162,19 @@ def cmd_search(args):
 
     results = None
 
+    if source == "pubmed":
+        print("Searching PubMed...", file=sys.stderr)
+        raw = _search_pubmed(args.query, args.max)
+        if raw:
+            results = ("PubMed", _normalize_pubmed_search(raw))
+        if not results:
+            print("No results from PubMed")
+            return
+        source_name, normalized = results
+        print(f"\nFound {len(normalized)} papers ({source_name}):\n")
+        _print_search_results(normalized)
+        return
+
     if source in ("s2", "auto"):
         if getattr(args, "bulk", False):
             print("Searching Semantic Scholar (bulk)...", file=sys.stderr)
@@ -200,7 +220,23 @@ def cmd_search(args):
 
 
 def cmd_info(args):
-    clean_id = extract_arxiv_id(args.arxiv_id)
+    id_type, clean_id = extract_paper_id(args.arxiv_id)
+
+    if id_type == "pmid":
+        paper = _fetch_paper_pubmed(clean_id)
+        if not paper:
+            print(f"Paper not found: PMID:{clean_id}", file=sys.stderr)
+            return
+        print_pubmed_info(clean_id, paper)
+        return
+
+    if id_type != "arxiv":
+        print(
+            f"Unrecognised identifier '{args.arxiv_id}' — currently `info` supports "
+            f"arXiv IDs and PMIDs.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     paper = get_paper_info(clean_id)
     if not paper:
@@ -320,9 +356,9 @@ def main():
     search_parser.add_argument("--max", type=int, default=20, help="最大结果数 (默认 20)")
     search_parser.add_argument(
         "--source",
-        choices=["auto", "s2", "openalex", "arxiv"],
+        choices=["auto", "s2", "openalex", "arxiv", "pubmed"],
         default="auto",
-        help="数据源: auto=自动(S2→OpenAlex→arXiv), s2, openalex, arxiv (默认 auto)",
+        help="数据源: auto=自动(S2→OpenAlex→arXiv), s2, openalex, arxiv, pubmed (默认 auto)",
     )
     search_parser.add_argument("--year", help="年份或范围 (如 2024, 2020-2024, 2020-)")
     search_parser.add_argument("--fields-of-study", help="研究领域，逗号分隔 (如 Computer Science,Physics)")
@@ -336,7 +372,7 @@ def main():
     search_parser.set_defaults(func=cmd_search)
 
     info_parser = subparsers.add_parser("info", help="获取论文信息（不下载全文）")
-    info_parser.add_argument("arxiv_id", help="arXiv ID")
+    info_parser.add_argument("arxiv_id", help="arXiv ID 或 PubMed PMID")
     info_parser.set_defaults(func=cmd_info)
 
     bib_parser = subparsers.add_parser("bib", help="生成 BibTeX 引用")
