@@ -578,15 +578,60 @@ class TestOAMirror:
     def test_find_urls_dedups_and_prefers_openalex_first(self):
         from lit.oa_mirror import find_oa_pdf_urls
         with patch("lit.oa_mirror._unpaywall_urls", return_value=["https://dup.pdf", "https://u.pdf"]), \
+             patch("lit.oa_mirror._core_urls", return_value=["https://core.pdf", "https://dup.pdf"]), \
              patch("lit.oa_mirror._crossref_tdm_pdf_urls", return_value=["https://dup.pdf", "https://c.pdf"]):
             urls = find_oa_pdf_urls(doi="10.1/x", openalex_pdf_url="https://oa.pdf")
-        assert urls == ["https://oa.pdf", "https://dup.pdf", "https://u.pdf", "https://c.pdf"]
+        assert urls == [
+            "https://oa.pdf", "https://dup.pdf", "https://u.pdf",
+            "https://core.pdf", "https://c.pdf",
+        ]
 
     def test_find_urls_tolerates_missing_contact_email(self):
         """_unpaywall_urls silently skips when CONTACT_EMAIL is empty."""
         from lit.oa_mirror import _unpaywall_urls
         with patch("lit.oa_mirror.CONTACT_EMAIL", ""):
             assert _unpaywall_urls("10.1/x") == []
+
+    def test_core_urls_skips_when_no_api_key(self):
+        from lit.oa_mirror import _core_urls
+        with patch("lit.oa_mirror.CORE_API_KEY", None):
+            assert _core_urls("10.1/x") == []
+
+    def test_core_urls_extracts_download_and_full_text_links(self):
+        from lit.oa_mirror import _core_urls
+
+        class R:
+            def raise_for_status(self): pass
+            def json(self):
+                return {
+                    "results": [
+                        {
+                            "downloadUrl": "https://repo.uni-x.edu/papers/abc.pdf",
+                            "fullTextLink": "https://repo.uni-x.edu/papers/abc",
+                        },
+                        {"downloadUrl": "https://other.edu/y.pdf", "fullTextLink": None},
+                        {"downloadUrl": None, "fullTextLink": None},  # skipped
+                    ],
+                }
+
+        with patch("lit.oa_mirror.CORE_API_KEY", "fakekey"), \
+             patch("lit.oa_mirror._request_with_retry", return_value=R()):
+            urls = _core_urls("10.1/x")
+        assert "https://repo.uni-x.edu/papers/abc.pdf" in urls
+        assert "https://repo.uni-x.edu/papers/abc" in urls
+        assert "https://other.edu/y.pdf" in urls
+        # No duplicates from the second-empty entry.
+        assert len(urls) == 3
+
+    def test_core_urls_returns_empty_on_request_failure(self):
+        from lit.oa_mirror import _core_urls
+        import requests as _r
+        with patch("lit.oa_mirror.CORE_API_KEY", "fakekey"), \
+             patch(
+                 "lit.oa_mirror._request_with_retry",
+                 side_effect=_r.RequestException("network down"),
+             ):
+            assert _core_urls("10.1/x") == []
 
     def test_try_download_pdf_rejects_html_masquerading_as_pdf(self):
         """HTML bodies must not be saved as .pdf (Cloudflare challenge pages)."""

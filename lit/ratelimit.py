@@ -44,8 +44,14 @@ class RateLimiter:
         "europepmc": 0.1,
         # Unpaywall: no strict limit published; 100ms is polite.
         "unpaywall": 0.1,
+        # CORE free tier: 10 req/min — 6.5s gap to leave headroom.
+        "core": 6.5,
         # Generic OA mirror PDF download (random third-party hosts).
         "oa_mirror": 0.5,
+        # Shadow libraries — keep conservative to avoid mirror IP blocks.
+        # Anna's & Sci-Hub are unstable and easy to overload.
+        "annas": 3.0,
+        "scihub": 3.0,
         "ut": 0.3,
     }
 

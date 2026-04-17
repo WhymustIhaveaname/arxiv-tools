@@ -136,6 +136,11 @@ def fetch_crossref_work(doi: str) -> dict | None:
             timeout=30,
         )
         return (resp.json() or {}).get("message") or None
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return None  # DOI not in Crossref — silent
+        print(f"Crossref DOI fetch failed: {_brief_error(e)}", file=sys.stderr)
+        return None
     except requests.RequestException as e:
         print(f"Crossref DOI fetch failed: {_brief_error(e)}", file=sys.stderr)
         return None

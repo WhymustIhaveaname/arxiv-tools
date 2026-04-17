@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import arxiv
@@ -59,7 +60,6 @@ from lit.ids import (
     sanitize_filename,
 )
 from lit.bibtex import (
-    STOPWORDS,
     generate_bibtex,
     generate_bibtex_pubmed,
     generate_citation_key,
@@ -69,9 +69,26 @@ from lit.browser import (
     browser_download_via_click,
     is_playwright_available,
 )
+from lit.aggregator import (
+    DEFAULT_SOURCES as AGG_DEFAULT_SOURCES,
+    aggregate_search,
+)
 from lit.crossref import fetch_bibtex_crossref
+from lit.display import (
+    print_aggregated_results as _print_aggregated_results,
+    print_doi_info as _print_doi_info,
+    print_search_results as _print_search_results,
+)
 from lit.enrich import enrich_paper_ids
+from lit.fetch import Layer, walk_layers
 from lit.oa_mirror import find_oa_pdf_urls, try_download_pdf
+from lit.pdf import (
+    extract_pdf_text as _pdf_extract_text,
+    ingest_local_pdf as _pdf_ingest,
+    save_pdf_and_text as _pdf_save,
+)
+from lit.preprint_lookup import PreprintVersion, find_preprint_versions
+from lit.shadow import try_shadow_libraries
 from lit.sources.chemrxiv import (
     _fetch_paper_chemrxiv,
     _normalize_chemrxiv_search,
@@ -229,25 +246,12 @@ def _is_biorxiv_doi(doi: str) -> bool:
 
 
 def _save_pdf_and_text(pdf_bytes: bytes, out_basename: str) -> None:
-    """Write ``{basename}.pdf`` + ``{basename}.txt`` to OUTPUT_DIR.
+    """Thin wrapper around :func:`lit.pdf.save_pdf_and_text` using OUTPUT_DIR.
 
-    The .txt is PyMuPDF's text extraction — readable by the LLM directly.
-    Skips text if extraction fails; the raw PDF remains usable.
+    OUTPUT_DIR is looked up dynamically at call time so tests that reassign
+    ``arxiv_tool.OUTPUT_DIR = tmp_path`` keep working.
     """
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    pdf_path = OUTPUT_DIR / f"{out_basename}.pdf"
-    txt_path = OUTPUT_DIR / f"{out_basename}.txt"
-    pdf_path.write_bytes(pdf_bytes)
-    print(f"Saved PDF: {pdf_path} ({len(pdf_bytes):,} bytes)")
-
-    text = _extract_pdf_text(pdf_bytes)
-    if text:
-        txt_path.write_text(
-            f"# {out_basename}\n\n## Full Text\n\n{text}", encoding="utf-8",
-        )
-        print(f"Saved text: {txt_path} ({len(text):,} chars)")
-    else:
-        print("PDF text extraction failed; raw PDF is still usable.", file=sys.stderr)
+    _pdf_save(pdf_bytes, out_basename, OUTPUT_DIR)
 
 
 def _try_oa_mirror_for_pdf(
@@ -315,34 +319,6 @@ def get_paper_info_doi(doi: str):
     return paper
 
 
-def _print_doi_info(doi: str, paper) -> None:
-    print(f"DOI: {doi}")
-    print(f"Title: {paper.title}")
-    print(f"Authors: {', '.join(a.name for a in paper.authors)}")
-    if paper.year:
-        print(f"Year: {paper.year}")
-    if paper.pmid:
-        print(f"PMID: {paper.pmid}")
-    if paper.pmcid:
-        print(f"PMC: {paper.pmcid}")
-    if paper.pdf_url:
-        print(f"PDF: {paper.pdf_url}")
-    if paper.abstract:
-        print(f"\nAbstract:\n{paper.abstract}")
-
-
-def _print_search_results(results: list[dict]) -> None:
-    for i, r in enumerate(results, 1):
-        print(f"[{i}] {r['id']}")
-        print(f"    Title: {r['title']}")
-        print(f"    Authors: {r['authors']}")
-        cited = f"  Cited: {r['cited_by']}" if r["cited_by"] is not None else ""
-        print(f"    Year: {r['year']}{cited}")
-        if r["abstract"]:
-            print(f"    Abstract: {r['abstract'].replace(chr(10), ' ')}")
-        print()
-
-
 def _s2_filters_from_args(args) -> dict:
     filters = {}
     if getattr(args, "year", None):
@@ -360,67 +336,66 @@ def _s2_filters_from_args(args) -> dict:
     return filters
 
 
+_SINGLE_SOURCE_DISPATCH: dict[str, tuple[str, Callable, Callable, tuple[str, ...]]] = {
+    "pubmed":    ("PubMed",                _search_pubmed,    _normalize_pubmed_search,
+                  ("offset", "year", "open_access")),
+    "europepmc": ("Europe PMC",            _search_europepmc, _normalize_europepmc_search,
+                  ("offset", "year", "open_access")),
+    "chemrxiv":  ("ChemRxiv (via Crossref)", _search_chemrxiv, _normalize_chemrxiv_search,
+                  ("offset", "year")),
+}
+
+
+def _run_single_source(args, source: str) -> None:
+    """One-source search dispatcher.
+
+    Each entry in :data:`_SINGLE_SOURCE_DISPATCH` declares which kwargs the
+    source's ``_search_*`` accepts; we forward only those to avoid
+    ``TypeError`` from sources that don't take e.g. ``open_access``.
+    """
+    label, search_fn, normalize_fn, accepted = _SINGLE_SOURCE_DISPATCH[source]
+    print(f"Searching {label}...", file=sys.stderr)
+    kwargs: dict = {}
+    if "offset" in accepted:
+        kwargs["offset"] = int(getattr(args, "offset", 0) or 0)
+    if "year" in accepted:
+        kwargs["year"] = getattr(args, "year", None)
+    if "open_access" in accepted:
+        kwargs["open_access"] = bool(getattr(args, "open_access", False))
+    raw = search_fn(args.query, args.max, **kwargs)
+    if not raw:
+        print(f"No results from {label}")
+        return
+    normalized = normalize_fn(raw)
+    print(f"\nFound {len(normalized)} papers ({label}):\n")
+    _print_search_results(normalized)
+
+
 def cmd_search(args):
     source = args.source
     filters = _s2_filters_from_args(args)
 
+    if source == "all":
+        agg_filters = dict(filters)
+        agg_filters["offset"] = getattr(args, "offset", 0) or 0
+        sources = list(AGG_DEFAULT_SOURCES)
+        print(
+            f"Searching {', '.join(sources)} in parallel...",
+            file=sys.stderr,
+        )
+        hits = aggregate_search(args.query, args.max, sources=sources, **agg_filters)
+        if not hits:
+            print("No results from any source")
+            return
+        print(f"\nFound {len(hits)} unique papers:\n")
+        _print_aggregated_results(hits)
+        return
+
+    if source in _SINGLE_SOURCE_DISPATCH:
+        _run_single_source(args, source)
+        return
+
     results = None
-
-    if source == "pubmed":
-        print("Searching PubMed...", file=sys.stderr)
-        raw = _search_pubmed(
-            args.query,
-            args.max,
-            offset=getattr(args, "offset", 0) or 0,
-            year=getattr(args, "year", None),
-            open_access=getattr(args, "open_access", False),
-        )
-        if raw:
-            results = ("PubMed", _normalize_pubmed_search(raw))
-        if not results:
-            print("No results from PubMed")
-            return
-        source_name, normalized = results
-        print(f"\nFound {len(normalized)} papers ({source_name}):\n")
-        _print_search_results(normalized)
-        return
-
-    if source == "europepmc":
-        print("Searching Europe PMC...", file=sys.stderr)
-        raw = _search_europepmc(
-            args.query,
-            args.max,
-            offset=getattr(args, "offset", 0) or 0,
-            year=getattr(args, "year", None),
-            open_access=getattr(args, "open_access", False),
-        )
-        if raw:
-            results = ("Europe PMC", _normalize_europepmc_search(raw))
-        if not results:
-            print("No results from Europe PMC")
-            return
-        source_name, normalized = results
-        print(f"\nFound {len(normalized)} papers ({source_name}):\n")
-        _print_search_results(normalized)
-        return
-
-    if source == "chemrxiv":
-        print("Searching ChemRxiv (via Crossref)...", file=sys.stderr)
-        raw = _search_chemrxiv(
-            args.query,
-            args.max,
-            offset=getattr(args, "offset", 0) or 0,
-            year=getattr(args, "year", None),
-        )
-        if raw:
-            results = ("ChemRxiv", _normalize_chemrxiv_search(raw))
-        if not results:
-            print("No results from ChemRxiv")
-            return
-        source_name, normalized = results
-        print(f"\nFound {len(normalized)} papers ({source_name}):\n")
-        _print_search_results(normalized)
-        return
 
     if source in ("s2", "auto"):
         if getattr(args, "bulk", False):
@@ -862,17 +837,61 @@ def cmd_tex(args):
         _fetch_pdf_fallback(args.arxiv_id, OUTPUT_DIR)
 
 
-def _extract_pdf_text(pdf_bytes: bytes) -> str | None:
-    """Pull plain text out of a PDF using PyMuPDF (fitz). Returns None on failure."""
-    import fitz
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except Exception:
-        return None
-    try:
-        return "\n".join(page.get_text().strip() for page in doc)
-    finally:
-        doc.close()
+# Re-exported for back-compat with code that imports `arxiv_tool._extract_pdf_text`.
+_extract_pdf_text = _pdf_extract_text
+
+
+def _already_saved(basename: str, *exts: str) -> bool:
+    """If any ``{basename}.{ext}`` already exists under OUTPUT_DIR, print and return True."""
+    for ext in exts:
+        path = OUTPUT_DIR / f"{basename}.{ext}"
+        if path.exists():
+            print(f"Already exists: {path}")
+            return True
+    return False
+
+
+def _fail_fulltext(message: str) -> None:
+    """Print a terminal-failure message to stderr and exit non-zero."""
+    print(f"\n{message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _try_pmc_to_disk(pmcid: str) -> bool:
+    """PMC layered chain. Returns True on first success, False if all layers fail."""
+    pmc_up = pmcid.upper()
+    if _already_saved(pmc_up, "xml", "bioc.json", "txt"):
+        return True
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _save_xml() -> bool:
+        xml = fetch_pmc_fulltext_xml(pmc_up)
+        if not xml:
+            return False
+        path = OUTPUT_DIR / f"{pmc_up}.xml"
+        path.write_text(xml, encoding="utf-8")
+        print(f"Saved JATS XML: {path} ({len(xml):,} bytes)")
+        return True
+
+    def _save_bioc() -> bool:
+        bioc = fetch_pmc_bioc_json(pmc_up)
+        if not bioc:
+            return False
+        path = OUTPUT_DIR / f"{pmc_up}.bioc.json"
+        path.write_text(bioc, encoding="utf-8")
+        print(f"Saved BioC JSON: {path} ({len(bioc):,} bytes)")
+        return True
+
+    layers = [
+        Layer(f"[1/3] Trying Europe PMC JATS XML for {pmc_up}...", _save_xml),
+        Layer(f"[2/3] JATS unavailable — trying NCBI BioC JSON...", _save_bioc),
+        Layer(f"[3/3] Structured formats unavailable — trying PMC PDF...",
+              lambda: fetch_pmc_pdf(pmc_up)),
+    ]
+    return walk_layers(
+        layers, basename=pmc_up, output_dir=OUTPUT_DIR,
+        source_url=f"https://pmc.ncbi.nlm.nih.gov/articles/{pmc_up}/",
+    )
 
 
 def _fetch_pmc_to_disk(pmcid: str) -> None:
@@ -887,187 +906,231 @@ def _fetch_pmc_to_disk(pmcid: str) -> None:
     path writes both the PDF itself and an adjacent .txt of extracted text so
     Claude can read either. If every format fails, exits non-zero.
     """
-    pmc_up = pmcid.upper()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    xml_path = OUTPUT_DIR / f"{pmc_up}.xml"
-    bioc_path = OUTPUT_DIR / f"{pmc_up}.bioc.json"
-    pdf_path = OUTPUT_DIR / f"{pmc_up}.pdf"
-    txt_path = OUTPUT_DIR / f"{pmc_up}.txt"
-    for existing in (xml_path, bioc_path, txt_path):
-        if existing.exists():
-            print(f"Already exists: {existing}")
-            return
-
-    print(f"[1/3] Trying Europe PMC JATS XML for {pmc_up}...", file=sys.stderr)
-    xml = fetch_pmc_fulltext_xml(pmc_up)
-    if xml:
-        xml_path.write_text(xml, encoding="utf-8")
-        print(f"Saved JATS XML: {xml_path} ({len(xml):,} bytes)")
+    if _try_pmc_to_disk(pmcid):
         return
-
-    print(f"[2/3] JATS unavailable — trying NCBI BioC JSON...", file=sys.stderr)
-    bioc = fetch_pmc_bioc_json(pmc_up)
-    if bioc:
-        bioc_path.write_text(bioc, encoding="utf-8")
-        print(f"Saved BioC JSON: {bioc_path} ({len(bioc):,} bytes)")
-        return
-
-    print(f"[3/3] Structured formats unavailable — trying PMC PDF...", file=sys.stderr)
-    pdf = fetch_pmc_pdf(pmc_up)
-    if pdf:
-        pdf_path.write_bytes(pdf)
-        print(f"Saved PDF: {pdf_path} ({len(pdf):,} bytes)")
-        text = _extract_pdf_text(pdf)
-        if text:
-            txt_path.write_text(
-                f"# {pmc_up}\n\nURL: https://pmc.ncbi.nlm.nih.gov/articles/{pmc_up}/\n\n## Full Text\n\n{text}",
-                encoding="utf-8",
-            )
-            print(f"Saved text: {txt_path} ({len(text):,} chars)")
-        else:
-            print("PDF text extraction failed; raw PDF is still usable.", file=sys.stderr)
-        return
-
-    print(
-        f"\nNo open-access full text available for {pmc_up} "
-        f"(JATS, BioC, and PDF all failed). Paper may be closed-access or withdrawn.",
-        file=sys.stderr,
+    _fail_fulltext(
+        f"No open-access full text available for {pmcid.upper()} "
+        f"(JATS, BioC, and PDF all failed). Paper may be closed-access or withdrawn."
     )
-    sys.exit(1)
+
+
+def _try_chemrxiv_to_disk(doi: str) -> bool:
+    """ChemRxiv layered chain. Returns True on first success.
+
+    Order: OA mirror → direct chemrxiv.org → Playwright click-path →
+    Playwright direct-with-warmup → shadow libraries. Most layers fail
+    behind Cloudflare; the OA-mirror layer catches papers cross-posted
+    elsewhere and is the most reliable path in practice.
+    """
+    safe = doi.lower().replace("/", "_")
+    if _already_saved(safe, "pdf", "txt"):
+        return True
+
+    cached = get_cached_paper(f"doi:{doi.lower()}")
+    openalex_pdf = (
+        cached.pdf_url
+        if cached and cached.pdf_url and "chemrxiv.org" not in cached.pdf_url
+        else None
+    )
+    article_url = f"https://chemrxiv.org/doi/full/{doi}"
+    landing_url = chemrxiv_pdf_url(doi) or article_url
+
+    layers = [
+        Layer(f"[1/5] Trying OA mirrors for {doi}...",
+              lambda: _try_oa_mirror_for_pdf(doi=doi, openalex_pdf_url=openalex_pdf)),
+        Layer("[2/5] Trying direct ChemRxiv PDF (likely Cloudflared)...",
+              lambda: fetch_chemrxiv_pdf(doi)),
+        Layer(f"[3/5] Trying browser click-path via {article_url[:80]}...",
+              lambda: browser_download_via_click(article_url)),
+        Layer(f"[4/5] Trying direct browser fetch of {landing_url[:80]}...",
+              lambda: browser_download_pdf(landing_url, warmup_url=article_url)),
+        Layer(f"[5/5] Trying shadow libraries for {doi}...",
+              lambda: try_shadow_libraries(doi)),
+    ]
+    return walk_layers(layers, basename=safe, output_dir=OUTPUT_DIR)
 
 
 def _fetch_chemrxiv_to_disk(doi: str) -> None:
-    """ChemRxiv full-text. Layered chain:
-       1. OA mirror (Unpaywall / OpenAlex / Crossref) — catches the ~60-80%
-          that also live on a non-Cloudflared host (published version,
-          institutional repo, arXiv cross-post).
-       2. Direct chemrxiv.org download (usually 403 but free to try).
-       3. Playwright headless browser — passes Cloudflare Turnstile.
-       4. Print URL for manual download.
-    """
-    safe = doi.lower().replace("/", "_")
-    pdf_path = OUTPUT_DIR / f"{safe}.pdf"
-    txt_path = OUTPUT_DIR / f"{safe}.txt"
-    if txt_path.exists() or pdf_path.exists():
-        print(f"Already exists: {txt_path if txt_path.exists() else pdf_path}")
+    if _try_chemrxiv_to_disk(doi):
         return
-
-    # Resolve OpenAlex OA URL in case cache has one already.
-    openalex_pdf = None
-    cached = get_cached_paper(f"doi:{doi.lower()}")
-    if cached and cached.pdf_url and "chemrxiv.org" not in cached.pdf_url:
-        openalex_pdf = cached.pdf_url
-
-    print(f"[1/3] Trying OA mirrors for {doi}...", file=sys.stderr)
-    pdf = _try_oa_mirror_for_pdf(doi=doi, openalex_pdf_url=openalex_pdf)
-    if pdf:
-        _save_pdf_and_text(pdf, safe)
-        return
-
-    print(f"[2/3] Trying direct ChemRxiv PDF (likely Cloudflared)...", file=sys.stderr)
-    pdf = fetch_chemrxiv_pdf(doi)
-    if pdf:
-        _save_pdf_and_text(pdf, safe)
-        return
-
-    # Layer 2a: click-path — open the HTML article page and hit its
-    # "Download PDF" link like a real user would. Works because
-    # Cloudflare's cookie gets applied to same-origin link clicks.
-    article_url = f"https://chemrxiv.org/doi/full/{doi}"
-    print(f"[3a/3] Trying browser click-path via {article_url[:80]}...",
-          file=sys.stderr)
-    pdf = browser_download_via_click(article_url)
-    if pdf:
-        _save_pdf_and_text(pdf, safe)
-        return
-
-    # Layer 2b: direct PDF URL fetch with warmup cookie. Stricter CF
-    # zones on the asset gateway often reject this path too, but worth a try.
-    landing_url = chemrxiv_pdf_url(doi) or article_url
-    print(f"[3b/3] Trying direct browser fetch of {landing_url[:80]}...",
-          file=sys.stderr)
-    pdf = browser_download_pdf(landing_url, warmup_url=article_url)
-    if pdf:
-        _save_pdf_and_text(pdf, safe)
-        return
-
-    print(
-        f"\nAll automatic full-text paths failed for {doi}.\n"
-        f"Open this URL in a real browser to download:\n  {landing_url}\n",
-        file=sys.stderr,
+    landing_url = chemrxiv_pdf_url(doi) or f"https://chemrxiv.org/doi/full/{doi}"
+    _fail_fulltext(
+        f"All automatic full-text paths failed for {doi}.\n"
+        f"Open this URL in a real browser to download:\n  {landing_url}"
     )
-    sys.exit(1)
 
 
-def _fetch_biorxiv_to_disk(doi: str) -> None:
-    """bioRxiv / medRxiv full text. Layered chain:
-       1. If Europe PMC has a PMC full-text copy (some preprints get one),
-          use the existing PMC chain (JATS XML → BioC JSON → PMC PDF).
-       2. OA mirror discovery (Unpaywall / OpenAlex / Crossref).
-       3. Playwright on the biorxiv.org landing page.
+def _try_biorxiv_to_disk(doi: str) -> bool:
+    """bioRxiv / medRxiv layered chain. Returns True on first success.
+
+    Order: Europe PMC PMC copy (some preprints have one) → OA mirror →
+    Playwright on landing page → shadow libraries. The first layer is
+    special-cased: if a PMC copy exists, we delegate to the PMC chain
+    (JATS / BioC / PDF) entirely, since structured XML beats Playwright.
     """
-    safe = doi.lower().replace("/", "_")
-
-    # 1. Europe PMC might have a PMC copy; re-use PMC chain.
     from lit.sources.europepmc import _fetch_paper_europepmc_by_doi
-    epmc = _fetch_paper_europepmc_by_doi(doi)
-    if epmc and epmc.pmcid:
-        print(f"[1/3] Europe PMC has {epmc.pmcid} for this preprint; using PMC chain.",
-              file=sys.stderr)
-        _fetch_pmc_to_disk(epmc.pmcid)
-        return
 
-    # 2. OA mirrors.
-    print(f"[1/3] Trying OA mirrors for {doi}...", file=sys.stderr)
-    openalex_pdf = None
+    safe = doi.lower().replace("/", "_")
+    if _already_saved(safe, "pdf", "txt"):
+        return True
+
     cached = get_cached_paper(f"doi:{doi.lower()}")
-    if cached and cached.pdf_url and "biorxiv" not in cached.pdf_url.lower() \
-                                  and "medrxiv" not in cached.pdf_url.lower():
-        openalex_pdf = cached.pdf_url
-    pdf = _try_oa_mirror_for_pdf(doi=doi, openalex_pdf_url=openalex_pdf)
-    if pdf:
-        _save_pdf_and_text(pdf, safe)
-        return
-
-    # 3. Playwright on the canonical PDF URL.
-    # bioRxiv / medRxiv PDF URL template: {site}/content/{DOI}v{n}.full.pdf
-    # We don't always know the version, so try the landing page; the browser
-    # will follow links and pick up any PDF response.
+    openalex_pdf = (
+        cached.pdf_url
+        if cached and cached.pdf_url
+        and "biorxiv" not in cached.pdf_url.lower()
+        and "medrxiv" not in cached.pdf_url.lower()
+        else None
+    )
     is_medrxiv = "medrxiv" in ((cached.pdf_url if cached else "") or "").lower()
     site = "medrxiv" if is_medrxiv else "biorxiv"
     landing = f"https://www.{site}.org/content/{doi}.full.pdf"
     warmup = f"https://www.{site}.org/content/{doi}"
-    print(f"[2/3] Trying headless browser on {landing}...", file=sys.stderr)
-    pdf = browser_download_pdf(landing, warmup_url=warmup)
-    if pdf:
-        _save_pdf_and_text(pdf, safe)
-        return
 
-    print(
-        f"\nAll automatic full-text paths failed for {doi}.\n"
-        f"Open this URL in a real browser to download:\n  {landing}\n",
-        file=sys.stderr,
+    def _try_europepmc_pmc() -> bool:
+        epmc = _fetch_paper_europepmc_by_doi(doi)
+        if not (epmc and epmc.pmcid):
+            return False
+        print(
+            f"  Europe PMC has {epmc.pmcid} for this preprint; using PMC chain.",
+            file=sys.stderr,
+        )
+        return _try_pmc_to_disk(epmc.pmcid)
+
+    layers = [
+        Layer(f"[1/4] Checking Europe PMC for a PMC copy of {doi}...",
+              _try_europepmc_pmc),
+        Layer(f"[2/4] Trying OA mirrors for {doi}...",
+              lambda: _try_oa_mirror_for_pdf(doi=doi, openalex_pdf_url=openalex_pdf)),
+        Layer(f"[3/4] Trying headless browser on {landing}...",
+              lambda: browser_download_pdf(landing, warmup_url=warmup)),
+        Layer(f"[4/4] Trying shadow libraries for {doi}...",
+              lambda: try_shadow_libraries(doi)),
+    ]
+    return walk_layers(layers, basename=safe, output_dir=OUTPUT_DIR)
+
+
+def _fetch_biorxiv_to_disk(doi: str) -> None:
+    if _try_biorxiv_to_disk(doi):
+        return
+    cached = get_cached_paper(f"doi:{doi.lower()}")
+    is_medrxiv = "medrxiv" in ((cached.pdf_url if cached else "") or "").lower()
+    site = "medrxiv" if is_medrxiv else "biorxiv"
+    landing = f"https://www.{site}.org/content/{doi}.full.pdf"
+    _fail_fulltext(
+        f"All automatic full-text paths failed for {doi}.\n"
+        f"Open this URL in a real browser to download:\n  {landing}"
     )
-    sys.exit(1)
 
 
 def _ingest_local_pdf(path_str: str, out_basename: str) -> None:
-    """Manual-download escape hatch: take a user-supplied PDF file and run
-    it through the normal save-PDF-and-extract-text pipeline.
+    """Thin wrapper around :func:`lit.pdf.ingest_local_pdf` using OUTPUT_DIR."""
+    _pdf_ingest(path_str, out_basename, OUTPUT_DIR)
 
-    Useful when every automatic path has failed (Cloudflare / WAF blocks,
-    paywall, whatever) — the user downloads once via a real browser, then
-    points the tool at the file so caching + text extraction proceed."""
-    p = Path(path_str).expanduser().resolve()
-    if not p.exists():
-        print(f"Local file not found: {p}", file=sys.stderr)
-        sys.exit(1)
-    data = p.read_bytes()
-    if data[:4] != b"%PDF":
-        print(f"File is not a PDF (missing %PDF magic header): {p}", file=sys.stderr)
-        sys.exit(1)
-    _save_pdf_and_text(data, out_basename)
+
+def _try_arxiv_to_disk(arxiv_id: str) -> bool:
+    """arXiv layered chain: LaTeX source → PDF fallback. Returns True on success.
+
+    ``_fetch_pdf_fallback`` returns silently when the response body is too
+    small to be a real PDF, so we verify a file actually exists before
+    declaring success.
+    """
+    result = fetch_tex_source(arxiv_id, OUTPUT_DIR)
+    if result:
+        # cmd_tex's success path also prints a directory tree; preserve that.
+        print("\nDirectory structure:")
+        print(result.name)
+        for line in print_tree(result):
+            print(line)
+        return True
+    print("\ntex download failed, falling back to PDF...", file=sys.stderr)
+    try:
+        _fetch_pdf_fallback(arxiv_id, OUTPUT_DIR)
+    except Exception as e:  # noqa: BLE001 — fall through to next preprint version
+        print(f"PDF fallback failed: {e}", file=sys.stderr)
+        return False
+    file_id = arxiv_id.replace("/", "_")
+    return any((OUTPUT_DIR / f"{file_id}.{ext}").exists() for ext in ("txt", "pdf"))
+
+
+def _try_preprint_versions(
+    versions: list[PreprintVersion], fallback_basename: str
+) -> bool:
+    """Walk preprint versions in priority order; return True at first success.
+
+    Each version dispatches to its source's ``_try_*_to_disk`` (returning
+    bool) so a failed version cleanly advances to the next without needing
+    exception-based control flow.
+    """
+    for v in versions:
+        label = f" ({v.version_label})" if v.version_label else ""
+        print(
+            f"  → trying {v.source} preprint version: {v.id}{label}",
+            file=sys.stderr,
+        )
+        if v.source == "arxiv":
+            if _try_arxiv_to_disk(v.id):
+                return True
+        elif v.source in ("biorxiv", "medrxiv"):
+            if _try_biorxiv_to_disk(v.id):
+                return True
+        elif v.source == "chemrxiv":
+            if _try_chemrxiv_to_disk(v.id):
+                return True
+        elif v.pdf_url:
+            # Other preprint hosts: just try the OpenAlex-supplied PDF URL.
+            pdf = try_download_pdf(v.pdf_url)
+            if pdf:
+                _save_pdf_and_text(pdf, fallback_basename)
+                return True
+    return False
+
+
+def _try_preprint_layer(doi: str, basename: str) -> bool:
+    """Layer wrapper: look up + walk preprint versions for ``doi``."""
+    versions = find_preprint_versions(doi=doi)
+    if not versions:
+        print("  No preprint versions known to OpenAlex.", file=sys.stderr)
+        return False
+    print(
+        f"  Found {len(versions)} preprint version(s): "
+        f"{', '.join(v.source for v in versions)}",
+        file=sys.stderr,
+    )
+    return _try_preprint_versions(versions, fallback_basename=basename)
+
+
+def _try_generic_doi_to_disk(doi: str) -> bool:
+    """Generic-DOI layered chain for paywalled journal articles.
+
+    Order: preprint reverse lookup (Nature/Cell/Science papers often have
+    an arXiv/bioRxiv twin) → OA mirror (Unpaywall/OpenAlex/CORE/Crossref) →
+    shadow libraries. Manual ``--from-file`` is the explicit escape hatch
+    when every layer fails.
+    """
+    safe = doi.lower().replace("/", "_")
+    if _already_saved(safe, "pdf", "txt"):
+        return True
+
+    layers = [
+        Layer(f"[1/3] Looking for preprint versions of {doi}...",
+              lambda: _try_preprint_layer(doi, safe)),
+        Layer(f"[2/3] Trying OA mirrors for {doi}...",
+              lambda: _try_oa_mirror_for_pdf(doi=doi)),
+        Layer(f"[3/3] Trying shadow libraries for {doi}...",
+              lambda: try_shadow_libraries(doi)),
+    ]
+    return walk_layers(layers, basename=safe, output_dir=OUTPUT_DIR)
+
+
+def _fetch_generic_doi_to_disk(doi: str) -> None:
+    if _try_generic_doi_to_disk(doi):
+        return
+    _fail_fulltext(
+        f"No automatic full-text path worked for {doi}.\n"
+        f"Open https://doi.org/{doi} in a real browser, then re-run with "
+        f"`--from-file <path>` to import the downloaded PDF."
+    )
 
 
 def cmd_fulltext(args):
@@ -1117,25 +1180,35 @@ def cmd_fulltext(args):
             _fetch_pmc_to_disk(pmcid)
             return
 
-        # No PMC copy → try OA mirrors (publisher OA, institutional repos).
-        # Layer-1 covers many papers marked "closed access" in PubMed.
+        # No PMC copy → walk preprint reverse lookup → OA mirror → shadow.
         doi_for_pmid = paper.doi if paper else None
-        print(
-            f"PMID:{clean_id} has no PMC copy — trying OA mirrors...",
-            file=sys.stderr,
-        )
+        basename = f"PMID{clean_id}"
         if doi_for_pmid:
-            pdf = _try_oa_mirror_for_pdf(doi=doi_for_pmid)
-            if pdf:
-                _save_pdf_and_text(pdf, f"PMID{clean_id}")
+            print(
+                f"PMID:{clean_id} has no PMC copy — walking DOI fallback chain...",
+                file=sys.stderr,
+            )
+            layers = [
+                Layer(
+                    f"[1/3] Looking for preprint versions of {doi_for_pmid}...",
+                    lambda: _try_preprint_layer(doi_for_pmid, basename),
+                ),
+                Layer(
+                    f"[2/3] Trying OA mirrors for {doi_for_pmid}...",
+                    lambda: _try_oa_mirror_for_pdf(doi=doi_for_pmid),
+                ),
+                Layer(
+                    f"[3/3] Trying shadow libraries for {doi_for_pmid}...",
+                    lambda: try_shadow_libraries(doi_for_pmid),
+                ),
+            ]
+            if walk_layers(layers, basename=basename, output_dir=OUTPUT_DIR):
                 return
 
-        print(
-            f"\nNo open-access full-text found for PMID:{clean_id} "
-            f"(no PMC copy, no OA mirror).",
-            file=sys.stderr,
+        _fail_fulltext(
+            f"No full-text found for PMID:{clean_id} "
+            f"(no PMC copy, no preprint, no OA mirror, no shadow library)."
         )
-        sys.exit(1)
 
     if id_type == "doi" and is_chemrxiv_doi(clean_id):
         _fetch_chemrxiv_to_disk(clean_id)
@@ -1145,9 +1218,15 @@ def cmd_fulltext(args):
         _fetch_biorxiv_to_disk(clean_id)
         return
 
+    if id_type == "doi":
+        # Generic journal DOI (Nature, Cell, Science, JACS, Angew, …) —
+        # no source-native chain. Walk preprint reverse lookup → OA mirror.
+        _fetch_generic_doi_to_disk(clean_id)
+        return
+
     print(
         f"Unrecognised or unsupported identifier '{args.arxiv_id}' — `fulltext` "
-        f"supports arXiv ID, PMID, PMC ID, ChemRxiv DOI, bioRxiv/medRxiv DOI.",
+        f"supports arXiv ID, PMID, PMC ID, DOI (any), bioRxiv/medRxiv DOI.",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -1173,14 +1252,18 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    search_parser = subparsers.add_parser("search", help="搜索论文 (S2→OpenAlex→arXiv)")
+    search_parser = subparsers.add_parser("search", help="搜索论文 (默认 all: 多源并行+去重)")
     search_parser.add_argument("query", help="搜索关键词")
     search_parser.add_argument("--max", type=int, default=20, help="最大结果数 (默认 20)")
     search_parser.add_argument(
         "--source",
-        choices=["auto", "s2", "openalex", "arxiv", "pubmed", "chemrxiv", "europepmc"],
-        default="auto",
-        help="数据源: auto=自动(S2→OpenAlex→arXiv), s2, openalex, arxiv, pubmed, chemrxiv, europepmc (默认 auto)",
+        choices=["all", "auto", "s2", "openalex", "arxiv", "pubmed", "chemrxiv", "europepmc"],
+        default="all",
+        help=(
+            "数据源 (默认 all: OpenAlex+S2+PubMed+EuropePMC+ChemRxiv+arXiv 并行搜索, "
+            "DOI/PMID/arXiv-ID 去重, 字段合并). 单源: s2, openalex, arxiv, pubmed, "
+            "chemrxiv, europepmc. auto=旧的 S2→OpenAlex→arXiv 串行 fallback."
+        ),
     )
     search_parser.add_argument("--year", help="年份或范围 (如 2024, 2020-2024, 2020-)")
     search_parser.add_argument("--fields-of-study", help="研究领域，逗号分隔 (如 Computer Science,Physics)")

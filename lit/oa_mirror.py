@@ -29,8 +29,9 @@ import sys
 
 import requests
 
-from lit.config import CONTACT_EMAIL, HTTP_HEADERS
+from lit.config import CONTACT_EMAIL, CORE_API_BASE, CORE_API_KEY, HTTP_HEADERS
 from lit.crossref import fetch_crossref_work
+from lit.pdf import is_pdf_bytes
 from lit.ratelimit import _brief_error, _request_with_retry
 
 
@@ -52,6 +53,11 @@ def _unpaywall_urls(doi: str) -> list[str]:
             timeout=30,
         )
         data = resp.json()
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return []  # DOI not indexed by Unpaywall — silent
+        print(f"Unpaywall lookup failed: {_brief_error(e)}", file=sys.stderr)
+        return []
     except requests.RequestException as e:
         print(f"Unpaywall lookup failed: {_brief_error(e)}", file=sys.stderr)
         return []
@@ -64,6 +70,49 @@ def _unpaywall_urls(doi: str) -> list[str]:
         u = loc.get("url_for_pdf")
         if u and u not in urls:
             urls.append(u)
+    return urls
+
+
+def _core_urls(doi: str) -> list[str]:
+    """OA PDF URLs from CORE.
+
+    CORE indexes ~280M open-access works pulled from institutional and
+    subject repositories — covers a different long tail than Unpaywall
+    (mirrors of preprints, university theses, etc.) so it adds incremental
+    coverage even after Unpaywall has been queried.
+
+    Free tier is 10 req/min; rate limiter slot ``core`` enforces 6.5s gap.
+    Silently no-ops when ``CORE_API_KEY`` is not configured.
+    """
+    if not CORE_API_KEY:
+        return []
+    try:
+        # Trailing slash matters: /search/works → HTML meta-refresh redirect
+        # to /search/works/, which `requests` won't follow automatically.
+        resp = _request_with_retry(
+            requests.get,
+            f"{CORE_API_BASE}/search/works/",
+            service="core",
+            params={"q": f'doi:"{doi}"', "limit": 5},
+            headers={**HTTP_HEADERS, "Authorization": f"Bearer {CORE_API_KEY}"},
+            timeout=30,
+        )
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"CORE lookup failed: {_brief_error(e)}", file=sys.stderr)
+        return []
+
+    urls: list[str] = []
+    for r in data.get("results") or []:
+        # downloadUrl is often empty or a generic repo landing page for
+        # paywalled papers; sourceFulltextUrls is the curated PDF list.
+        for u in r.get("sourceFulltextUrls") or []:
+            if u and u not in urls:
+                urls.append(u)
+        for fld in ("downloadUrl", "fullTextLink"):
+            u = (r.get(fld) or "").strip()
+            if u and u not in urls:
+                urls.append(u)
     return urls
 
 
@@ -105,6 +154,8 @@ def find_oa_pdf_urls(
     if doi:
         for u in _unpaywall_urls(doi):
             _add(u)
+        for u in _core_urls(doi):
+            _add(u)
         for u in _crossref_tdm_pdf_urls(doi):
             _add(u)
 
@@ -135,6 +186,6 @@ def try_download_pdf(url: str, *, timeout: int = 60) -> bytes | None:
         print(f"OA mirror download failed ({url[:60]}...): {_brief_error(e)}", file=sys.stderr)
         return None
 
-    if not resp.content or resp.content[:4] != b"%PDF":
+    if not is_pdf_bytes(resp.content):
         return None
     return resp.content
