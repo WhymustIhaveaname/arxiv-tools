@@ -94,6 +94,46 @@ def fetch_pubmed_references(pmid: str) -> list[str] | None:
     return []
 
 
+def fetch_similar_pmids(pmid: str, max_results: int = 20) -> list[str] | None:
+    """Fetch PubMed's "similar articles" PMIDs, ranked by topic relevance.
+
+    Uses ELink with ``linkname=pubmed_pubmed`` — NCBI's co-citation /
+    MeSH-overlap relatedness model. Returns PMIDs sorted by decreasing
+    similarity (the API's native order); the caller can slice to taste.
+
+    Returns ``None`` on transport error, ``[]`` for papers with no
+    similar-article links indexed (rare).
+    """
+    url = f"{PUBMED_API_BASE}/elink.fcgi"
+    try:
+        resp = _request_with_retry(
+            requests.get,
+            url,
+            service="pubmed",
+            params=_pubmed_params(
+                dbfrom="pubmed",
+                db="pubmed",
+                linkname="pubmed_pubmed",
+                id=pmid,
+                retmode="json",
+            ),
+            headers=HTTP_HEADERS,
+            timeout=30,
+        )
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"PubMed ELink similar fetch failed: {_brief_error(e)}", file=sys.stderr)
+        return None
+
+    for ls in data.get("linksets") or []:
+        for ldb in ls.get("linksetdbs") or []:
+            if ldb.get("linkname") == "pubmed_pubmed":
+                # First entry is the seed PMID itself — drop it.
+                links = [str(x) for x in ldb.get("links") or [] if str(x) != pmid]
+                return links[:max_results]
+    return []
+
+
 def fetch_esummary_batch(pmids: list[str]) -> list[dict] | None:
     """Public wrapper around ``_esummary`` returning a list of ESummary dicts.
 

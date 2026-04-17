@@ -1179,21 +1179,17 @@ class TestCmdInfoDispatch:
             pmid="123",
             pdf_url="u",
         )
-        with patch("arxiv_tool._fetch_paper_pubmed", return_value=fake) as mock_pm, \
-             patch("arxiv_tool.get_paper_info") as mock_arxiv:
+        with patch("arxiv_tool.aggregate_lookup", return_value=fake) as mock_agg:
             arxiv_tool.cmd_info(self._args("39876543"))
-        mock_pm.assert_called_once_with("39876543")
-        mock_arxiv.assert_not_called()
+        mock_agg.assert_called_once_with(pmid="39876543")
         out = capsys.readouterr().out
         assert "PMID: 39876543" in out
         assert "abs" in out
 
-    def test_arxiv_id_routes_to_existing_path(self):
-        with patch("arxiv_tool._fetch_paper_pubmed") as mock_pm, \
-             patch("arxiv_tool.get_paper_info", return_value=MOCK_PAPER) as mock_arxiv:
+    def test_arxiv_id_routes_to_existing_path(self, cache_db):
+        with patch("arxiv_tool.aggregate_lookup", return_value=MOCK_PAPER) as mock_agg:
             arxiv_tool.cmd_info(self._args("1706.03762"))
-        mock_pm.assert_not_called()
-        mock_arxiv.assert_called_once_with("1706.03762")
+        mock_agg.assert_called_once_with(arxiv_id="1706.03762")
 
     def test_unknown_id_exits_nonzero(self):
         with patch("arxiv_tool._fetch_paper_pubmed") as mock_pm, \
@@ -1389,9 +1385,9 @@ class TestFetchTexSourceFailure:
 class TestCmdInfo:
     """cmd_info 输出完整性"""
 
-    def test_output_fields(self, capsys):
+    def test_output_fields(self, capsys, cache_db):
         """输出应包含所有关键字段"""
-        with patch("arxiv_tool.get_paper_info", return_value=MOCK_PAPER):
+        with patch("arxiv_tool.aggregate_lookup", return_value=MOCK_PAPER):
             args = argparse.Namespace(arxiv_id=TEST_ID)
             arxiv_tool.cmd_info(args)
 
@@ -1403,9 +1399,9 @@ class TestCmdInfo:
         assert "cs.CL" in out
         assert "dominant sequence transduction" in out
 
-    def test_not_found_no_output(self, capsys):
+    def test_not_found_no_output(self, capsys, cache_db):
         """论文未找到时不输出论文信息"""
-        with patch("arxiv_tool.get_paper_info", return_value=None):
+        with patch("arxiv_tool.aggregate_lookup", return_value=None):
             args = argparse.Namespace(arxiv_id="9999.99999")
             arxiv_tool.cmd_info(args)
 
@@ -2204,3 +2200,108 @@ class TestCitedOpenAlex:
         assert ret is not None
         results, _ = ret
         assert len(results) <= 3
+
+
+# ════════════════════════════════════════════════════════════════════
+#  similar (PubMed ELink pubmed_pubmed)
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestFetchSimilarPmids:
+    """fetch_similar_pmids — PubMed similar-article ELink wrapper."""
+
+    def _resp(self, json_data):
+        from unittest.mock import MagicMock
+        r = MagicMock()
+        r.json.return_value = json_data
+        r.raise_for_status.return_value = None
+        return r
+
+    def test_extracts_links_in_order(self):
+        from lit.sources import pubmed
+        data = {
+            "linksets": [{
+                "linksetdbs": [{
+                    "linkname": "pubmed_pubmed",
+                    "links": ["32866453", "12345", "67890", "11111"],
+                }],
+            }],
+        }
+        with patch("lit.sources.pubmed._request_with_retry", return_value=self._resp(data)):
+            out = pubmed.fetch_similar_pmids("32866453", max_results=10)
+        # First entry was the seed PMID — should be dropped.
+        assert out == ["12345", "67890", "11111"]
+
+    def test_max_results_truncates(self):
+        from lit.sources import pubmed
+        data = {
+            "linksets": [{
+                "linksetdbs": [{
+                    "linkname": "pubmed_pubmed",
+                    "links": ["seed"] + [f"sim{i}" for i in range(10)],
+                }],
+            }],
+        }
+        with patch("lit.sources.pubmed._request_with_retry", return_value=self._resp(data)):
+            out = pubmed.fetch_similar_pmids("seed", max_results=3)
+        assert out == ["sim0", "sim1", "sim2"]
+
+    def test_no_matching_linkname_returns_empty(self):
+        """ELink may return only refs / citedin links if pubmed_pubmed has no data."""
+        from lit.sources import pubmed
+        data = {
+            "linksets": [{
+                "linksetdbs": [
+                    {"linkname": "pubmed_pubmed_refs", "links": ["111"]},
+                ],
+            }],
+        }
+        with patch("lit.sources.pubmed._request_with_retry", return_value=self._resp(data)):
+            out = pubmed.fetch_similar_pmids("seed")
+        assert out == []
+
+    def test_request_failure_returns_none(self):
+        from lit.sources import pubmed
+        with patch(
+            "lit.sources.pubmed._request_with_retry",
+            side_effect=requests.RequestException("net down"),
+        ):
+            out = pubmed.fetch_similar_pmids("seed")
+        assert out is None
+
+
+class TestCmdSimilar:
+    """cmd_similar CLI behavior."""
+
+    def _args(self, arxiv_id, max=20, offset=0):
+        return argparse.Namespace(arxiv_id=arxiv_id, max=max, offset=offset)
+
+    def test_rejects_arxiv_id(self):
+        with pytest.raises(SystemExit):
+            arxiv_tool.cmd_similar(self._args("2401.12345"))
+
+    def test_rejects_doi(self):
+        with pytest.raises(SystemExit):
+            arxiv_tool.cmd_similar(self._args("10.1038/foo"))
+
+    def test_pmid_invokes_elink_then_esummary(self, capsys):
+        sim = ["111", "222", "333"]
+        records = [
+            {"uid": "111", "title": "Paper One", "authors": [{"name": "A", "authtype": "Author"}], "pubdate": "2024"},
+            {"uid": "222", "title": "Paper Two", "authors": [{"name": "B", "authtype": "Author"}], "pubdate": "2023"},
+            {"uid": "333", "title": "Paper Three", "authors": [{"name": "C", "authtype": "Author"}], "pubdate": "2022"},
+        ]
+        with patch("arxiv_tool.fetch_similar_pmids", return_value=sim), \
+             patch("arxiv_tool.fetch_esummary_batch", return_value=records):
+            arxiv_tool.cmd_similar(self._args("9999999", max=3))
+        out = capsys.readouterr().out
+        assert "Paper One" in out
+        assert "Paper Two" in out
+        assert "Paper Three" in out
+        assert "Showing similar articles #1-3" in out
+
+    def test_no_similar_prints_friendly_message(self, capsys):
+        with patch("arxiv_tool.fetch_similar_pmids", return_value=[]):
+            arxiv_tool.cmd_similar(self._args("9999999"))
+        out = capsys.readouterr().out
+        assert "No similar articles" in out

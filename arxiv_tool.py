@@ -55,6 +55,7 @@ from lit.ids import (
     _arxiv_date,
     _arxiv_year,
     _truncate_authors,
+    basename_for_id,
     extract_arxiv_id,
     extract_paper_id,
     sanitize_filename,
@@ -71,6 +72,8 @@ from lit.browser import (
 )
 from lit.aggregator import (
     DEFAULT_SOURCES as AGG_DEFAULT_SOURCES,
+    DOMAIN_PRESETS as AGG_DOMAIN_PRESETS,
+    aggregate_lookup,
     aggregate_search,
 )
 from lit.crossref import fetch_bibtex_crossref
@@ -80,6 +83,7 @@ from lit.display import (
     print_search_results as _print_search_results,
 )
 from lit.enrich import enrich_paper_ids
+from lit.batch import run_batch, run_import
 from lit.fetch import Layer, walk_layers
 from lit.oa_mirror import find_oa_pdf_urls, try_download_pdf
 from lit.pdf import (
@@ -129,6 +133,7 @@ from lit.sources.pubmed import (
     fetch_esummary_batch,
     fetch_pmc_pdf,
     fetch_pubmed_references,
+    fetch_similar_pmids,
     pmcid_to_pmid,
     pmid_to_pmcid,
     print_pubmed_info,
@@ -378,7 +383,26 @@ def cmd_search(args):
     if source == "all":
         agg_filters = dict(filters)
         agg_filters["offset"] = getattr(args, "offset", 0) or 0
+        if getattr(args, "snippet", False):
+            agg_filters["snippet"] = True
+            print(
+                "Using S2 /snippet/search (full-text snippet ranking) instead of /paper/search",
+                file=sys.stderr,
+            )
         sources = list(AGG_DEFAULT_SOURCES)
+        domain = getattr(args, "domain", None)
+        if domain:
+            preset = AGG_DOMAIN_PRESETS[domain]  # argparse choices guards this
+            sources = list(preset["sources"])
+            # Domain field_of_study filter wins over user-supplied --fields-of-study
+            # only when the user didn't provide one.
+            if "fields_of_study" not in agg_filters and preset.get("fields_of_study"):
+                agg_filters["fields_of_study"] = preset["fields_of_study"]
+            print(
+                f"Domain {domain!r}: restricting to {', '.join(sources)}"
+                f" + S2 fields_of_study={agg_filters.get('fields_of_study')!r}",
+                file=sys.stderr,
+            )
         print(
             f"Searching {', '.join(sources)} in parallel...",
             file=sys.stderr,
@@ -451,29 +475,26 @@ def _resolve_pmcid_or_die(pmcid: str) -> str:
 
 
 def cmd_info(args):
+    """Display paper metadata from a parallel multi-source lookup.
+
+    Cache check first (so repeated calls are free). On cache miss, runs
+    every source that supports the ID type concurrently and merges fields
+    — broadest abstract, longest author list, union of cross-ref IDs. The
+    legacy single-source ``get_paper_info_*`` helpers stay available to
+    library callers for backward compatibility.
+    """
     id_type, clean_id = extract_paper_id(args.arxiv_id)
 
     if id_type == "pmcid":
         clean_id = _resolve_pmcid_or_die(clean_id)
         id_type = "pmid"
 
-    if id_type == "pmid":
-        paper = get_paper_info_pubmed(clean_id)
-        if not paper:
-            print(f"Paper not found: PMID:{clean_id}", file=sys.stderr)
-            return
-        print_pubmed_info(clean_id, paper)
-        return
-
-    if id_type == "doi":
-        paper = get_paper_info_doi(clean_id)
-        if not paper:
-            print(f"Paper not found: DOI:{clean_id}", file=sys.stderr)
-            return
-        _print_doi_info(clean_id, paper)
-        return
-
-    if id_type != "arxiv":
+    cache_key = {
+        "arxiv": f"arxiv:{clean_id}",
+        "pmid":  f"pmid:{clean_id}",
+        "doi":   f"doi:{clean_id.lower()}",
+    }.get(id_type)
+    if cache_key is None:
         print(
             f"Unrecognised identifier '{args.arxiv_id}' — supported: arXiv ID, "
             f"PMID, PMC ID, DOI.",
@@ -481,13 +502,32 @@ def cmd_info(args):
         )
         sys.exit(1)
 
-    paper = get_paper_info(clean_id)
-    if not paper:
+    paper = get_cached_paper(cache_key)
+    if paper is None:
+        kwargs = {id_type if id_type != "arxiv" else "arxiv_id": clean_id}
+        paper = aggregate_lookup(**kwargs)
+        if paper is None:
+            label = {"arxiv": "arXiv", "pmid": "PMID", "doi": "DOI"}[id_type]
+            print(f"Paper not found: {label}:{clean_id}", file=sys.stderr)
+            return
+        # Caching is best-effort: if enrich/cache crash on a partial record
+        # (e.g. test fixtures missing a field), still print what we have.
+        try:
+            enrich_paper_ids(paper)
+            cache_paper_with_crossrefs(cache_key, paper, "")
+        except Exception as e:  # noqa: BLE001
+            print(f"[cmd_info] cache write failed: {e}", file=sys.stderr)
+
+    if id_type == "pmid":
+        print_pubmed_info(clean_id, paper)
+        return
+    if id_type == "doi":
+        _print_doi_info(clean_id, paper)
         return
 
+    # arxiv path
     arxiv_date = _arxiv_date(clean_id)
     date_str = arxiv_date.strftime("%Y-%m") if arxiv_date else "?"
-
     print(f"arXiv ID: {clean_id}")
     print(f"Title: {paper.title}")
     print(f"Authors: {', '.join(a.name for a in paper.authors)}")
@@ -824,6 +864,44 @@ def cmd_references(args):
     print(f"\nNo references found for {display_id}")
 
 
+def cmd_similar(args):
+    """Similar-articles list for a PubMed paper.
+
+    Wraps NCBI's ``elink.fcgi?linkname=pubmed_pubmed`` — a co-citation /
+    MeSH-overlap relatedness ranking. PMID-only: arXiv / DOI / PMC IDs are
+    rejected (NCBI's similarity model is PubMed-internal).
+    """
+    id_type, clean_id = extract_paper_id(args.arxiv_id)
+    if id_type == "pmcid":
+        clean_id = _resolve_pmcid_or_die(clean_id)
+        id_type = "pmid"
+    if id_type != "pmid":
+        print(
+            f"`similar` only supports PMID — got {id_type or 'unknown'} "
+            f"({args.arxiv_id}). Look up the PubMed PMID first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"Querying PubMed ELink (similar): PMID:{clean_id}")
+    sim_pmids = fetch_similar_pmids(clean_id, max_results=args.max + args.offset)
+    if not sim_pmids:
+        print(f"No similar articles found for PMID:{clean_id}")
+        return
+
+    page = sim_pmids[args.offset : args.offset + args.max]
+    records = fetch_esummary_batch(page)
+    if not records:
+        print("ESummary returned no records.", file=sys.stderr)
+        return
+
+    start = args.offset + 1
+    end = args.offset + len(records)
+    print(f"\nSource: PubMed ELink (pubmed_pubmed) + ESummary")
+    print(f"Showing similar articles #{start}-{end} of {len(sim_pmids)}:\n")
+    _print_references_pubmed(records, start)
+
+
 def cmd_tex(args):
     result = fetch_tex_source(args.arxiv_id, OUTPUT_DIR)
     if result:
@@ -1150,18 +1228,7 @@ def cmd_fulltext(args):
     id_type, clean_id = extract_paper_id(args.arxiv_id)
 
     if args.from_file:
-        # Derive a stable basename from whichever ID form we were given.
-        if id_type == "pmid":
-            basename = f"PMID{clean_id}"
-        elif id_type == "pmcid":
-            basename = clean_id.upper()
-        elif id_type == "doi":
-            basename = clean_id.lower().replace("/", "_")
-        elif id_type == "arxiv":
-            basename = clean_id.replace("/", "_")
-        else:
-            basename = clean_id
-        _ingest_local_pdf(args.from_file, basename)
+        _ingest_local_pdf(args.from_file, basename_for_id(id_type, clean_id))
         return
 
     if id_type == "arxiv":
@@ -1232,6 +1299,69 @@ def cmd_fulltext(args):
     sys.exit(1)
 
 
+def _try_fulltext_for_id(id_type: str, clean_id: str) -> bool:
+    """Unified ID-type → fulltext dispatch returning bool.
+
+    Mirrors the cmd_fulltext routing tree but never calls ``sys.exit``;
+    used by the batch driver to walk a list of IDs without aborting on
+    any one failure. Each branch delegates to its ``_try_*_to_disk``
+    layered chain (which already returns bool).
+    """
+    if id_type == "arxiv":
+        return _try_arxiv_to_disk(clean_id)
+    if id_type == "pmcid":
+        return _try_pmc_to_disk(clean_id)
+    if id_type == "pmid":
+        # PMC chain first (structured), DOI fallback chain second.
+        paper = get_paper_info_pubmed(clean_id)
+        pmcid = paper.pmcid if paper and paper.pmcid else pmid_to_pmcid(clean_id)
+        if pmcid and _try_pmc_to_disk(pmcid):
+            return True
+        doi = paper.doi if paper else None
+        if not doi:
+            return False
+        basename = basename_for_id("pmid", clean_id)
+        layers = [
+            Layer(f"  preprint reverse lookup for {doi}",
+                  lambda: _try_preprint_layer(doi, basename)),
+            Layer(f"  OA mirrors for {doi}",
+                  lambda: _try_oa_mirror_for_pdf(doi=doi)),
+            Layer(f"  shadow libraries for {doi}",
+                  lambda: try_shadow_libraries(doi)),
+        ]
+        return walk_layers(layers, basename=basename, output_dir=OUTPUT_DIR)
+    if id_type == "doi":
+        if is_chemrxiv_doi(clean_id):
+            return _try_chemrxiv_to_disk(clean_id)
+        if _is_biorxiv_doi(clean_id):
+            return _try_biorxiv_to_disk(clean_id)
+        return _try_generic_doi_to_disk(clean_id)
+    return False
+
+
+def cmd_fulltext_batch(args):
+    """Walk a file of paper IDs through the fulltext chain; manifest the failures."""
+    ids_path = Path(args.ids_file).expanduser().resolve()
+    if not ids_path.exists():
+        print(f"IDs file not found: {ids_path}", file=sys.stderr)
+        sys.exit(1)
+    manifest_path = (
+        Path(args.manifest).expanduser().resolve()
+        if args.manifest
+        else OUTPUT_DIR / "fulltext_failed.tsv"
+    )
+    run_batch(ids_path, try_fetch=_try_fulltext_for_id, manifest_path=manifest_path)
+
+
+def cmd_fulltext_import(args):
+    """Scan a directory for manually-downloaded PDFs and ingest each."""
+    pdf_dir = Path(args.pdf_dir).expanduser().resolve()
+    manifest_path = (
+        Path(args.manifest).expanduser().resolve() if args.manifest else None
+    )
+    run_import(pdf_dir, OUTPUT_DIR, manifest_path=manifest_path)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="arXiv 论文搜索与全文获取工具",
@@ -1264,6 +1394,15 @@ def main():
             "DOI/PMID/arXiv-ID 去重, 字段合并). 单源: s2, openalex, arxiv, pubmed, "
             "chemrxiv, europepmc. auto=旧的 S2→OpenAlex→arXiv 串行 fallback."
         ),
+    )
+    search_parser.add_argument(
+        "--domain",
+        choices=sorted(AGG_DOMAIN_PRESETS.keys()),
+        help="领域快捷方式 (仅与 --source all 配合): bio/med/chem/cs/phys, 限定相关源 + S2 fields_of_study",
+    )
+    search_parser.add_argument(
+        "--snippet", action="store_true",
+        help="改用 S2 /snippet/search (按全文片段命中排序), 适合查技术术语 (仅 --source all)",
     )
     search_parser.add_argument("--year", help="年份或范围 (如 2024, 2020-2024, 2020-)")
     search_parser.add_argument("--fields-of-study", help="研究领域，逗号分隔 (如 Computer Science,Physics)")
@@ -1324,6 +1463,18 @@ def main():
     )
     annotations_parser.set_defaults(func=cmd_annotations)
 
+    similar_parser = subparsers.add_parser(
+        "similar",
+        help="相似论文 (NCBI ELink pubmed_pubmed, 仅支持 PMID)",
+    )
+    similar_parser.add_argument("arxiv_id", help="PubMed PMID (或 PMC ID, 会先转 PMID)")
+    similar_parser.add_argument("--max", type=int, default=20, help="最大显示条数 (默认 20)")
+    similar_parser.add_argument(
+        "--offset", type=int, default=0,
+        help="跳过前 N 条 (默认 0). 注意 NCBI 按相关度排序, 越大越次要",
+    )
+    similar_parser.set_defaults(func=cmd_similar)
+
     references_parser = subparsers.add_parser(
         "references", help="正向引用: 这篇论文引用了哪些 (S2 优先, PMID 时 PubMed ELink 兜底)"
     )
@@ -1347,6 +1498,33 @@ def main():
         help="手动兜底: 已经通过浏览器下载好的 PDF 路径, 跳过全部在线下载直接提文本入库",
     )
     fulltext_parser.set_defaults(func=cmd_fulltext)
+
+    batch_parser = subparsers.add_parser(
+        "fulltext-batch",
+        help="批量下载全文: 读 ID 列表逐个跑, 失败的写到 manifest TSV 等待手动下载",
+    )
+    batch_parser.add_argument(
+        "ids_file",
+        help="每行一个 ID 的文本文件 (# 注释 / 空行忽略). 支持 arXiv / PMID / PMC ID / DOI",
+    )
+    batch_parser.add_argument(
+        "--manifest", metavar="PATH",
+        help="失败 ID 的输出 TSV 路径 (默认 OUTPUT_DIR/fulltext_failed.tsv)",
+    )
+    batch_parser.set_defaults(func=cmd_fulltext_batch)
+
+    import_parser = subparsers.add_parser(
+        "fulltext-import",
+        help="批量导入手动下载的 PDF: 扫目录, 按 manifest / 文件名匹配 ID, 入缓存",
+    )
+    import_parser.add_argument(
+        "pdf_dir", help="包含 *.pdf 的目录, 文件名建议跟 manifest 的 basename 一致",
+    )
+    import_parser.add_argument(
+        "--manifest", metavar="PATH",
+        help="fulltext-batch 产出的 TSV; 用于按 basename 精准匹配. 不给也能跑 (会用文件名启发式)",
+    )
+    import_parser.set_defaults(func=cmd_fulltext_import)
 
     args = parser.parse_args()
     try:

@@ -463,3 +463,98 @@ class TestAggregateSearch:
         assert set(DEFAULT_SOURCES) == {
             "openalex", "s2", "pubmed", "europepmc", "chemrxiv", "arxiv"
         }
+
+
+class TestSnippetMode:
+    """Aggregator routes S2 to /snippet/search when filters['snippet'] is True."""
+
+    def test_snippet_filter_invokes_snippet_endpoint(self):
+        snippet_raw = [{
+            "paperId": "abc",
+            "title": "Snippet Paper",
+            "year": 2024,
+            "authors": [{"name": "Carol"}],
+            "abstract": "matched body fragment",
+            "citationCount": 7,
+            "externalIds": {"DOI": "10.1/snip"},
+        }]
+        with patch("lit.aggregator._search_s2_snippet", return_value=snippet_raw) as snip, \
+             patch("lit.aggregator._search_s2") as plain:
+            hits = _hits_from_s2("query", 10, snippet=True)
+        snip.assert_called_once()
+        plain.assert_not_called()
+        assert len(hits) == 1
+        assert hits[0].abstract == "matched body fragment"
+
+    def test_default_path_does_not_use_snippet(self):
+        with patch("lit.aggregator._search_s2", return_value=None) as plain, \
+             patch("lit.aggregator._search_s2_snippet") as snip:
+            _hits_from_s2("query", 10)
+        plain.assert_called_once()
+        snip.assert_not_called()
+
+
+class TestS2SnippetSearch:
+    """lit/sources/s2.py::_search_s2_snippet — endpoint shape adaptation."""
+
+    def _resp(self, json_data):
+        from unittest.mock import MagicMock
+        r = MagicMock()
+        r.json.return_value = json_data
+        r.raise_for_status.return_value = None
+        return r
+
+    def test_collapses_multiple_snippets_per_paper(self):
+        from lit.sources.s2 import _search_s2_snippet
+        data = {"data": [
+            {"snippet": {"text": "hit one"}, "paper": {"corpusId": "1", "title": "P1",
+             "year": 2024, "authors": [{"name": "A"}], "externalIds": {}, "citationCount": 5}},
+            {"snippet": {"text": "hit two same paper"}, "paper": {"corpusId": "1",
+             "title": "P1", "year": 2024, "authors": [{"name": "A"}], "externalIds": {}, "citationCount": 5}},
+            {"snippet": {"text": "hit three"}, "paper": {"corpusId": "2", "title": "P2",
+             "year": 2023, "authors": [{"name": "B"}], "externalIds": {}, "citationCount": 0}},
+        ]}
+        with patch("lit.sources.s2._request_with_retry", return_value=self._resp(data)):
+            out = _search_s2_snippet("hit", max_results=10)
+        # Two unique papers, first snippet wins per paper.
+        assert len(out) == 2
+        assert out[0]["abstract"] == "hit one"
+        assert out[1]["abstract"] == "hit three"
+
+
+class TestDomainPresets:
+    """Sanity-check the per-domain source/filter shortcuts."""
+
+    def test_bio_excludes_arxiv_and_chemrxiv(self):
+        from lit.aggregator import DOMAIN_PRESETS
+        srcs = set(DOMAIN_PRESETS["bio"]["sources"])
+        assert {"openalex", "s2", "pubmed", "europepmc"} <= srcs
+        assert "arxiv" not in srcs
+        assert "chemrxiv" not in srcs
+
+    def test_chem_includes_chemrxiv_excludes_pubmed_arxiv(self):
+        from lit.aggregator import DOMAIN_PRESETS
+        srcs = set(DOMAIN_PRESETS["chem"]["sources"])
+        assert "chemrxiv" in srcs
+        assert "pubmed" not in srcs
+        assert "arxiv" not in srcs
+
+    def test_cs_includes_arxiv_excludes_biomed(self):
+        from lit.aggregator import DOMAIN_PRESETS
+        srcs = set(DOMAIN_PRESETS["cs"]["sources"])
+        assert "arxiv" in srcs
+        assert "pubmed" not in srcs
+        assert "europepmc" not in srcs
+
+    def test_every_domain_includes_openalex_and_s2(self):
+        """OpenAlex+S2 are the broadest indexes — every domain should keep them."""
+        from lit.aggregator import DOMAIN_PRESETS
+        for name, preset in DOMAIN_PRESETS.items():
+            srcs = set(preset["sources"])
+            assert "openalex" in srcs, f"{name} missing openalex"
+            assert "s2" in srcs, f"{name} missing s2"
+
+    def test_every_domain_has_fields_of_study(self):
+        from lit.aggregator import DOMAIN_PRESETS
+        for name, preset in DOMAIN_PRESETS.items():
+            assert preset.get("fields_of_study"), f"{name} missing fields_of_study"

@@ -63,6 +63,28 @@ def _arxiv_year(arxiv_id: str) -> int | None:
     return d.year if d else None
 
 
+def basename_for_id(id_type: str, clean_id: str) -> str:
+    """Map (id_type, clean_id) → the stable on-disk basename used by every
+    fulltext output path. Single source of truth so manual ``--from-file``
+    ingest, batch fetch, and import-from-dir all share one naming rule.
+
+    Conventions:
+      pmid   → ``PMID<digits>``
+      pmcid  → uppercased ``PMC<digits>``
+      doi    → lowercased, ``/`` → ``_`` (matches publisher chains)
+      arxiv  → ``/`` → ``_`` (handles old-format ``cs/0401001``)
+    """
+    if id_type == "pmid":
+        return f"PMID{clean_id}"
+    if id_type == "pmcid":
+        return clean_id.upper()
+    if id_type == "doi":
+        return clean_id.lower().replace("/", "_")
+    if id_type == "arxiv":
+        return clean_id.replace("/", "_")
+    return clean_id
+
+
 def _truncate_authors(names: list[str], limit: int = 3) -> str:
     result = ", ".join(names[:limit])
     if len(names) > limit:

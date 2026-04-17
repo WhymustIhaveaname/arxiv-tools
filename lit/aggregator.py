@@ -18,12 +18,25 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from lit.ids import _arxiv_year
-from lit.sources.arxiv_api import search_papers as _search_arxiv
-from lit.sources.chemrxiv import _search_chemrxiv
-from lit.sources.europepmc import _search_europepmc
-from lit.sources.openalex import _reconstruct_abstract, _search_openalex
-from lit.sources.pubmed import _search_pubmed
-from lit.sources.s2 import _search_s2
+from lit.sources.arxiv_api import _fetch_paper_arxiv, search_papers as _search_arxiv
+from lit.sources.chemrxiv import (
+    _fetch_paper_chemrxiv,
+    _search_chemrxiv,
+    is_chemrxiv_doi,
+)
+from lit.sources.europepmc import (
+    _fetch_paper_europepmc_by_doi,
+    _search_europepmc,
+)
+from lit.sources.openalex import (
+    _fetch_paper_openalex,
+    _fetch_paper_openalex_spec,
+    _reconstruct_abstract,
+    _search_openalex,
+)
+from lit.sources.pubmed import _fetch_paper_pubmed, _search_pubmed
+from lit.sources.s2 import _fetch_paper_s2, _search_s2, _search_s2_snippet
+from paper_cache import CachedPaper
 
 
 ALL_SOURCES = ("openalex", "s2", "pubmed", "europepmc", "chemrxiv", "arxiv")
@@ -36,6 +49,32 @@ SOURCE_SHORT = {
     "europepmc": "EPMC",
     "chemrxiv": "ChR",
     "arxiv": "AX",
+}
+
+# Domain shortcuts: limit the source set + apply an S2 fields_of_study filter.
+# OpenAlex + S2 are kept in every domain because they're the broadest indexes;
+# the rest are added/dropped based on relevance.
+DOMAIN_PRESETS: dict[str, dict] = {
+    "bio": {
+        "sources": ("openalex", "s2", "pubmed", "europepmc"),
+        "fields_of_study": "Biology,Medicine",
+    },
+    "med": {
+        "sources": ("openalex", "s2", "pubmed", "europepmc"),
+        "fields_of_study": "Medicine",
+    },
+    "chem": {
+        "sources": ("openalex", "s2", "chemrxiv", "europepmc"),
+        "fields_of_study": "Chemistry,Materials Science",
+    },
+    "cs": {
+        "sources": ("openalex", "s2", "arxiv"),
+        "fields_of_study": "Computer Science",
+    },
+    "phys": {
+        "sources": ("openalex", "s2", "arxiv"),
+        "fields_of_study": "Physics",
+    },
 }
 
 _ARXIV_DOI_RE = re.compile(r"10\.48550/arxiv\.(.+)$", re.IGNORECASE)
@@ -120,8 +159,12 @@ def _hits_from_openalex(query: str, max_results: int, **_filters) -> list[Aggreg
 
 
 def _hits_from_s2(query: str, max_results: int, **filters) -> list[AggregatedHit]:
-    s2_filters = {k: v for k, v in filters.items() if k in _S2_KNOWN_FILTERS}
-    raw = _search_s2(query, max_results, **s2_filters)
+    if filters.get("snippet"):
+        # /snippet/search ignores filter kwargs (the endpoint doesn't take them).
+        raw = _search_s2_snippet(query, max_results)
+    else:
+        s2_filters = {k: v for k, v in filters.items() if k in _S2_KNOWN_FILTERS}
+        raw = _search_s2(query, max_results, **s2_filters)
     if not raw:
         return []
     out: list[AggregatedHit] = []
@@ -471,3 +514,107 @@ def aggregate_search(
             all_hits.extend(_safe(name, fn))
 
     return _rank(_dedup(all_hits))[:max_results]
+
+
+# --------------------------------------------------------------------------
+# parallel single-paper lookup (for cmd_info)
+# --------------------------------------------------------------------------
+
+
+def _pick_longer_str(a: str | None, b: str | None) -> str | None:
+    if not a:
+        return b
+    if not b:
+        return a
+    return a if len(a) >= len(b) else b
+
+
+def _merge_papers(papers: list["CachedPaper"]) -> "CachedPaper":
+    """Field-by-field merge of multiple CachedPaper records → one rich record.
+
+    Preference rules (asymmetric on purpose, matching the per-source
+    sanitization in single-source paths):
+      - title: first non-empty (sources tend to agree; OpenAlex sometimes
+        capitalises differently)
+      - authors: longest list (most sources truncate)
+      - abstract: longest non-empty (PubMed/EuropePMC abstracts are typically
+        canonical; OpenAlex's reconstructed-from-inverted-index can be slightly
+        different word order but still longer than nothing)
+      - year: prefer non-empty; ties broken by first-encountered
+      - doi/pmid/pmcid/arxiv_id/pdf_url/categories: union (first non-empty)
+      - source: comma-separated tag of all contributing sources
+    """
+    base = papers[0]
+    sources = [base.source] if base.source else []
+    for p in papers[1:]:
+        if not base.title and p.title:
+            base.title = p.title
+        if len(p.authors) > len(base.authors):
+            base.authors = p.authors
+        merged_abstract = _pick_longer_str(base.abstract or None, p.abstract or None)
+        if merged_abstract:
+            base.abstract = merged_abstract
+        base.year = base.year or p.year
+        base.doi = base.doi or p.doi
+        base.pmid = base.pmid or p.pmid
+        base.pmcid = base.pmcid or p.pmcid
+        base.arxiv_id = base.arxiv_id or p.arxiv_id
+        base.pdf_url = base.pdf_url or p.pdf_url
+        if not base.categories and p.categories:
+            base.categories = p.categories
+        if p.source and p.source not in sources:
+            sources.append(p.source)
+    if sources:
+        base.source = "+".join(sources)
+    return base
+
+
+def aggregate_lookup(
+    *,
+    arxiv_id: str | None = None,
+    doi: str | None = None,
+    pmid: str | None = None,
+) -> "CachedPaper | None":
+    """Parallel multi-source single-paper lookup.
+
+    Routes the lookup to every source that supports the given ID type:
+      - arxiv_id → OpenAlex + S2 + arXiv API
+      - doi      → OpenAlex + Europe PMC; ChemRxiv too if it's a 10.26434 DOI
+      - pmid     → PubMed + OpenAlex (via pmid: accessor)
+
+    Sources run concurrently; any one going down doesn't block the others.
+    Returns the merged :class:`paper_cache.CachedPaper` (richest single
+    record) or ``None`` if every source comes back empty.
+    """
+    fetchers: list[tuple[str, callable]] = []
+    if arxiv_id:
+        fetchers.append(("openalex", lambda: _fetch_paper_openalex(arxiv_id)))
+        fetchers.append(("s2",       lambda: _fetch_paper_s2(arxiv_id)))
+        fetchers.append(("arxiv",    lambda: _fetch_paper_arxiv(arxiv_id)))
+    if doi:
+        fetchers.append(("openalex", lambda: _fetch_paper_openalex_spec(f"DOI:{doi}")))
+        fetchers.append(("europepmc", lambda: _fetch_paper_europepmc_by_doi(doi)))
+        if is_chemrxiv_doi(doi):
+            fetchers.append(("chemrxiv", lambda: _fetch_paper_chemrxiv(doi)))
+    if pmid:
+        fetchers.append(("pubmed",   lambda: _fetch_paper_pubmed(pmid)))
+        fetchers.append(("openalex", lambda: _fetch_paper_openalex_spec(f"PMID:{pmid}")))
+
+    if not fetchers:
+        return None
+
+    papers: list[CachedPaper] = []
+    with ThreadPoolExecutor(max_workers=len(fetchers)) as ex:
+        future_to_name = {ex.submit(fn): name for name, fn in fetchers}
+        for fut in as_completed(future_to_name):
+            name = future_to_name[fut]
+            try:
+                p = fut.result()
+            except Exception as e:  # noqa: BLE001 — never let one source kill the lookup
+                print(f"[aggregate_lookup] {name} failed: {e}", file=sys.stderr)
+                continue
+            if p is not None:
+                papers.append(p)
+    if not papers:
+        return None
+    return _merge_papers(papers)

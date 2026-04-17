@@ -71,6 +71,62 @@ def _search_s2(query: str, max_results: int = 10, **filters) -> list[dict] | Non
     return data["data"][:max_results]
 
 
+def _search_s2_snippet(query: str, max_results: int = 10) -> list[dict] | None:
+    """S2 full-text snippet search → list of paper records (regular search shape).
+
+    Hits the ``/snippet/search`` endpoint, which returns text fragments from
+    indexed full-text where ``query`` appears, each tagged with the parent
+    paper. We collapse to one record per paper (first/best snippet wins),
+    fold the snippet text into ``abstract`` so it shows in default output,
+    and return in the same shape as :func:`_search_s2` so the aggregator
+    can swap endpoints transparently.
+
+    Useful when ``--snippet`` is set: instead of S2's title/abstract keyword
+    match, you get papers whose body text mentions the phrase. Great for
+    technical terms that authors don't put in titles.
+    """
+    try:
+        resp = _request_with_retry(
+            requests.get,
+            f"{S2_API_BASE}/snippet/search",
+            service="s2",
+            params={"query": query, "limit": min(max_results, 100)},
+            headers=_s2_headers(),
+            timeout=30,
+        )
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"Semantic Scholar snippet search failed: {_brief_error(e)}", file=sys.stderr)
+        return None
+
+    if not data.get("data"):
+        return None
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in data["data"]:
+        paper = item.get("paper") or {}
+        pid = str(paper.get("corpusId") or paper.get("paperId") or "")
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        snippet_text = (item.get("snippet") or {}).get("text") or ""
+        # Reshape into the regular /paper/search response shape so callers
+        # (incl. aggregator's _hits_from_s2) need no special-casing.
+        out.append({
+            "paperId": paper.get("paperId"),
+            "title": paper.get("title") or "",
+            "year": paper.get("year"),
+            "authors": paper.get("authors") or [],
+            "abstract": snippet_text or paper.get("abstract"),
+            "citationCount": paper.get("citationCount"),
+            "externalIds": paper.get("externalIds") or {},
+        })
+        if len(out) >= max_results:
+            break
+    return out or None
+
+
 def _search_s2_bulk(
     query: str,
     max_results: int = 100,
