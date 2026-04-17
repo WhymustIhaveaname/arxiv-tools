@@ -1175,24 +1175,43 @@ def _try_preprint_layer(doi: str, basename: str) -> bool:
     return _try_preprint_versions(versions, fallback_basename=basename)
 
 
+def _try_europepmc_pmc_for_doi(doi: str) -> bool:
+    """If this DOI has a PMC copy (per Europe PMC), walk the PMC chain.
+
+    Many OA-published Wiley/Nature/Cell/JACS articles sit in PMC with full
+    JATS XML; using that avoids the publisher paywall entirely.
+    """
+    epmc = _fetch_paper_europepmc_by_doi(doi)
+    if not (epmc and epmc.pmcid):
+        return False
+    print(
+        f"  Europe PMC has {epmc.pmcid} for this DOI; using PMC chain.",
+        file=sys.stderr,
+    )
+    return _try_pmc_to_disk(epmc.pmcid)
+
+
 def _try_generic_doi_to_disk(doi: str) -> bool:
     """Generic-DOI layered chain for paywalled journal articles.
 
-    Order: preprint reverse lookup (Nature/Cell/Science papers often have
-    an arXiv/bioRxiv twin) → OA mirror (Unpaywall/OpenAlex/CORE/Crossref) →
-    shadow libraries. Manual ``--from-file`` is the explicit escape hatch
-    when every layer fails.
+    Order: PMC cross-link (many OA journal articles have a PMC copy with
+    clean JATS XML) → preprint reverse lookup (Nature/Cell/Science papers
+    often have an arXiv/bioRxiv twin) → OA mirror (Unpaywall/OpenAlex/
+    CORE/Crossref) → shadow libraries. Manual ``--from-file`` is the
+    explicit escape hatch when every layer fails.
     """
     safe = doi.lower().replace("/", "_")
     if _already_saved(safe, "pdf", "txt"):
         return True
 
     layers = [
-        Layer(f"[1/3] Looking for preprint versions of {doi}...",
+        Layer(f"[1/4] Checking Europe PMC for a PMC copy of {doi}...",
+              lambda: _try_europepmc_pmc_for_doi(doi)),
+        Layer(f"[2/4] Looking for preprint versions of {doi}...",
               lambda: _try_preprint_layer(doi, safe)),
-        Layer(f"[2/3] Trying OA mirrors for {doi}...",
+        Layer(f"[3/4] Trying OA mirrors for {doi}...",
               lambda: _try_oa_mirror_for_pdf(doi=doi)),
-        Layer(f"[3/3] Trying shadow libraries for {doi}...",
+        Layer(f"[4/4] Trying shadow libraries for {doi}...",
               lambda: try_shadow_libraries(doi)),
     ]
     return walk_layers(layers, basename=safe, output_dir=OUTPUT_DIR)

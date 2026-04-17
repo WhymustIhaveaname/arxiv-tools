@@ -26,6 +26,7 @@ from dataclasses import dataclass
 import requests
 
 from lit.config import OPENALEX_API_BASE, S2_API_BASE
+from lit.crossref import fetch_crossref_work, search_crossref
 from lit.ratelimit import _brief_error, _request_with_retry
 from lit.sources.openalex import _openalex_params
 from lit.sources.s2 import _s2_headers
@@ -203,8 +204,91 @@ def find_preprint_versions(doi: str | None = None) -> list[PreprintVersion]:
                 )
             )
 
+    # Tertiary: title-fuzzy search on preprint servers. When a publisher
+    # doesn't file the preprint link with Crossref/OpenAlex (Wiley is a
+    # frequent offender), a title+author query against each preprint DOI
+    # prefix reliably surfaces the twin. Only runs when earlier layers
+    # came up empty to avoid duplicate preprint servers chatter.
+    if not versions:
+        versions.extend(_title_fuzzy_preprint_lookup(doi))
+
     versions.sort(key=lambda v: _PRIORITY.get(v.source, 99))
     return versions
+
+
+# DOI prefixes used by each preprint server that registers with Crossref.
+# arXiv is absent by design — arXiv doesn't register most of its papers with
+# Crossref, so this path can't find them (S2 handles that case above).
+_PREPRINT_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("chemrxiv", "10.26434"),
+    ("biorxiv", "10.1101"),
+    ("researchsquare", "10.21203"),
+    ("ssrn", "10.2139"),
+)
+
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _title_tokens(title: str) -> set[str]:
+    """Normalise a title to a token set for Jaccard similarity."""
+    return set(_TOKEN_RE.findall((title or "").lower()))
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _title_fuzzy_preprint_lookup(doi: str) -> list[PreprintVersion]:
+    """Find preprint twin(s) of ``doi`` by title search on each preprint server.
+
+    Approach: fetch the target DOI's title from Crossref, then query Crossref
+    with title + DOI-prefix filter for each preprint server. Accept a hit
+    only when its title's Jaccard similarity to the target is >= 0.85 — high
+    enough to reject same-author follow-up papers, low enough to tolerate
+    the small title edits that sometimes happen between preprint and press.
+    """
+    # Don't look up preprint versions of a preprint.
+    for _, prefix in _PREPRINT_PREFIXES:
+        if doi.lower().startswith(f"{prefix}/"):
+            return []
+
+    msg = fetch_crossref_work(doi)
+    if not msg:
+        return []
+    target_title = (msg.get("title") or [""])[0]
+    if len(target_title) < 20:
+        # Too-short titles yield noisy token-set matches ("Corrigendum", etc.).
+        return []
+    target_tokens = _title_tokens(target_title)
+
+    results: list[PreprintVersion] = []
+    for source, prefix in _PREPRINT_PREFIXES:
+        items = search_crossref(
+            target_title,
+            max_results=3,
+            prefix=prefix,
+            work_type="posted-content",
+        ) or []
+        for it in items:
+            cand_title = (it.get("title") or [""])[0]
+            if _jaccard(target_tokens, _title_tokens(cand_title)) < 0.85:
+                continue
+            cand_doi = (it.get("DOI") or "").lower()
+            if not cand_doi:
+                continue
+            results.append(
+                PreprintVersion(
+                    source=source,
+                    id=_strip_doi_suffix(cand_doi),
+                    landing_url=f"https://doi.org/{cand_doi}",
+                    version_label="submittedVersion",
+                )
+            )
+            break  # one match per server is enough
+    return results
 
 
 def _arxiv_id_from_s2(doi: str) -> str | None:

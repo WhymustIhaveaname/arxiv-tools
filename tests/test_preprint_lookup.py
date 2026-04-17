@@ -11,7 +11,10 @@ from lit.preprint_lookup import (
     PreprintVersion,
     _canonical_source,
     _id_from_location,
+    _jaccard,
     _strip_doi_suffix,
+    _title_fuzzy_preprint_lookup,
+    _title_tokens,
     find_preprint_versions,
 )
 
@@ -340,3 +343,91 @@ class TestFindPreprintVersions:
             versions = find_preprint_versions(doi="10.1/x")
         # Sorted by priority: arxiv → biorxiv → chemrxiv
         assert [v.source for v in versions] == ["arxiv", "biorxiv", "chemrxiv"]
+
+
+class TestTitleTokens:
+    def test_tokenises_and_lowercases(self):
+        assert _title_tokens("Hello, World 2024!") == {"hello", "world", "2024"}
+
+    def test_empty_and_none(self):
+        assert _title_tokens("") == set()
+        assert _title_tokens(None) == set()  # type: ignore[arg-type]
+
+
+class TestJaccard:
+    def test_identical(self):
+        s = {"a", "b", "c"}
+        assert _jaccard(s, s) == 1.0
+
+    def test_disjoint(self):
+        assert _jaccard({"a"}, {"b"}) == 0.0
+
+    def test_half_overlap(self):
+        # {a,b} ∩ {b,c} = {b}, union = {a,b,c} → 1/3
+        assert abs(_jaccard({"a", "b"}, {"b", "c"}) - 1 / 3) < 1e-9
+
+    def test_empty_input_returns_zero(self):
+        assert _jaccard(set(), {"a"}) == 0.0
+
+
+class TestTitleFuzzyPreprintLookup:
+    """Fuzzy title search on preprint servers — covers the case where
+    publishers haven't registered the preprint→published link with
+    Crossref/OpenAlex (Wiley is a known offender)."""
+
+    def test_skips_when_doi_is_already_a_preprint(self):
+        # No point searching for a preprint twin of a ChemRxiv DOI.
+        assert _title_fuzzy_preprint_lookup("10.26434/chemrxiv-2024-zmmnw") == []
+        assert _title_fuzzy_preprint_lookup("10.1101/2024.01.01.123") == []
+
+    def test_empty_when_target_title_missing(self):
+        with patch("lit.preprint_lookup.fetch_crossref_work", return_value=None):
+            assert _title_fuzzy_preprint_lookup("10.1002/anie.99999") == []
+
+    def test_empty_when_title_too_short(self):
+        # 20-char minimum guards against junky titles like "Corrigendum"
+        # producing false-positive token-set matches.
+        with patch(
+            "lit.preprint_lookup.fetch_crossref_work",
+            return_value={"title": ["Erratum"]},
+        ):
+            assert _title_fuzzy_preprint_lookup("10.1002/anie.99999") == []
+
+    def test_matches_high_jaccard_chemrxiv_twin(self):
+        target_title = "Advancing Structure Elucidation with a Flexible Multi-Spectral AI Model"
+        candidate_title = target_title  # 100% overlap
+        candidate = {"DOI": "10.26434/chemrxiv-2024-zmmnw-v2", "title": [candidate_title]}
+
+        def mock_search(query, max_results=3, prefix=None, work_type=None):
+            # Only the ChemRxiv prefix call returns a hit; others empty.
+            if prefix == "10.26434":
+                return [candidate]
+            return None
+
+        with patch(
+            "lit.preprint_lookup.fetch_crossref_work",
+            return_value={"title": [target_title]},
+        ), patch(
+            "lit.preprint_lookup.search_crossref",
+            side_effect=mock_search,
+        ):
+            versions = _title_fuzzy_preprint_lookup("10.1002/anie.202517611")
+
+        assert len(versions) == 1
+        assert versions[0].source == "chemrxiv"
+        assert versions[0].id == "10.26434/chemrxiv-2024-zmmnw-v2"
+
+    def test_rejects_low_jaccard_hit(self):
+        target_title = "Advancing Structure Elucidation with a Flexible Multi-Spectral AI Model"
+        noise = {"DOI": "10.26434/chemrxiv-bogus", "title": ["Totally Unrelated Paper About Catalysis"]}
+
+        with patch(
+            "lit.preprint_lookup.fetch_crossref_work",
+            return_value={"title": [target_title]},
+        ), patch(
+            "lit.preprint_lookup.search_crossref",
+            return_value=[noise],
+        ):
+            versions = _title_fuzzy_preprint_lookup("10.1002/anie.202517611")
+
+        assert versions == []

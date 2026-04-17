@@ -558,3 +558,45 @@ class TestDomainPresets:
         from lit.aggregator import DOMAIN_PRESETS
         for name, preset in DOMAIN_PRESETS.items():
             assert preset.get("fields_of_study"), f"{name} missing fields_of_study"
+
+
+class TestDropIrrelevantSingletons:
+    """Single-source hits without any query-token overlap should be dropped;
+    multi-source hits and single-source hits with overlap should survive."""
+
+    def _filter(self, hits, query):
+        from lit.aggregator import _drop_irrelevant_singletons
+        return _drop_irrelevant_singletons(hits, query)
+
+    def test_multisource_always_kept_even_with_no_overlap(self):
+        # Source consensus overrides token-overlap — two APIs agreeing is signal.
+        h = AggregatedHit(title="Federated Learning", sources=["s2", "openalex"])
+        assert self._filter([h], "structure elucidation nmr") == [h]
+
+    def test_singleton_with_overlap_kept(self):
+        h = AggregatedHit(title="Structure Elucidation from NMR", sources=["s2"])
+        assert self._filter([h], "structure elucidation nmr") == [h]
+
+    def test_singleton_without_overlap_dropped(self):
+        h = AggregatedHit(title="Federated Learning Advances", sources=["openalex"])
+        out = self._filter([h], "structure elucidation nmr ir spectroscopy")
+        assert out == []
+
+    def test_stopword_only_overlap_dropped(self):
+        # "a", "the", "of" are stripped from the query — title overlap via those
+        # words alone isn't evidence of relevance.
+        h = AggregatedHit(title="The A Of To", sources=["openalex"])
+        out = self._filter([h], "structure of the new flexible model")
+        assert out == []
+
+    def test_empty_query_keeps_everything(self):
+        # Degenerate case — no tokens to match against, so filter is a no-op.
+        h = AggregatedHit(title="Random Paper", sources=["openalex"])
+        assert self._filter([h], "the of a") == [h]
+
+    def test_preserves_order(self):
+        a = AggregatedHit(title="Structure NMR", sources=["s2"])
+        b = AggregatedHit(title="Elucidation IR", sources=["s2"])
+        c = AggregatedHit(title="Unrelated Topic", sources=["s2"])
+        out = self._filter([a, b, c], "structure elucidation")
+        assert out == [a, b]  # c dropped, a/b kept in original order

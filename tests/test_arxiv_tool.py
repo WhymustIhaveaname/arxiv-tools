@@ -891,6 +891,58 @@ class TestChemRxivAdapter:
         assert paper.pdf_url.endswith(".pdf")
         assert "Catalysis" in paper.categories
 
+    def test_abstract_is_degenerate_sentinels(self):
+        """The 'Publication status: Published' sentinel is the main bug this
+        guards against — a Crossref admin string should not pass as an abstract."""
+        from lit.sources.chemrxiv import _abstract_is_degenerate
+        assert _abstract_is_degenerate("")
+        assert _abstract_is_degenerate(None)
+        assert _abstract_is_degenerate("Publication status: Published")
+        assert _abstract_is_degenerate("publication status: published")  # case-insensitive
+        assert _abstract_is_degenerate("tiny")  # too short (< 50 chars)
+        real = (
+            "We introduce the MultiModalSpectralTransformer (MMST), a machine "
+            "learning method that predicts chemical structures directly from "
+            "diverse spectral data (NMR, IR, and MS)."
+        )
+        assert not _abstract_is_degenerate(real)
+
+    def test_degenerate_abstract_falls_back_to_published_twin(self):
+        """When the preprint's Crossref abstract is the sentinel string, the
+        adapter should follow relation.is-preprint-of → published DOI and
+        pull a real abstract from there."""
+        from lit.sources.chemrxiv import _fetch_paper_chemrxiv
+
+        preprint_msg = {
+            **self.CROSSREF_ITEM,
+            "abstract": "<jats:p>Publication status: Published</jats:p>",
+            "relation": {
+                "is-preprint-of": [
+                    {"id-type": "doi", "id": "10.1002/anie.99999", "asserted-by": "subject"}
+                ]
+            },
+        }
+        published_msg = {
+            "abstract": "<jats:p>We introduce a transformer for spectral data that predicts molecular structures directly.</jats:p>",
+        }
+        calls = []
+
+        def mock_fetch(doi):
+            calls.append(doi)
+            if doi == "10.26434/chemrxiv-2024-XYZ":
+                return preprint_msg
+            if doi == "10.1002/anie.99999":
+                return published_msg
+            return None
+
+        with patch("lit.sources.chemrxiv.fetch_crossref_work", side_effect=mock_fetch):
+            paper = _fetch_paper_chemrxiv("10.26434/chemrxiv-2024-XYZ")
+
+        assert paper is not None
+        assert "transformer for spectral data" in paper.abstract
+        assert "Publication status" not in paper.abstract
+        assert "10.1002/anie.99999" in calls  # followed the twin link
+
     def test_pdf_fetch_returns_none_on_cloudflare_challenge(self):
         """fetch_chemrxiv_pdf should return None when Cloudflare returns HTML."""
         from lit.sources.chemrxiv import fetch_chemrxiv_pdf

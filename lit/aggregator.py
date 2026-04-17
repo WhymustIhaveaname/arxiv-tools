@@ -472,6 +472,55 @@ def _rank(hits: list[AggregatedHit]) -> list[AggregatedHit]:
     )
 
 
+# Stopwords stripped before computing title↔query token overlap. Kept
+# intentionally small — real content words like "learning" or "structure"
+# are valid signal; only true filler words are dropped.
+_RELEVANCE_STOPWORDS = frozenset({
+    "a", "an", "and", "as", "at", "be", "by", "for", "from", "in", "is", "it",
+    "of", "on", "or", "the", "to", "with", "via", "using", "based", "toward",
+    "towards", "new", "novel",
+})
+
+_RELEVANCE_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _significant_query_tokens(query: str) -> set[str]:
+    """Return query tokens worth matching against titles.
+
+    Drops stopwords and one-character tokens; case-insensitive.
+    """
+    return {
+        t
+        for t in _RELEVANCE_TOKEN_RE.findall((query or "").lower())
+        if len(t) >= 2 and t not in _RELEVANCE_STOPWORDS
+    }
+
+
+def _drop_irrelevant_singletons(
+    hits: list[AggregatedHit], query: str
+) -> list[AggregatedHit]:
+    """Remove single-source hits whose titles share zero significant query tokens.
+
+    Multi-source hits (≥2 contributing APIs) are always kept — source consensus
+    is evidence enough. Single-source hits must show at least one non-stopword
+    query token in their title to survive. This catches the failure mode where
+    OpenAlex/S2 relevance ranking leaks a popular paper that merely shares a
+    generic word like "Advances" or "Model" with the query.
+    """
+    q_tokens = _significant_query_tokens(query)
+    if not q_tokens:
+        return hits  # Can't filter — user's query is all stopwords.
+    kept: list[AggregatedHit] = []
+    for h in hits:
+        if len(h.sources) >= 2:
+            kept.append(h)
+            continue
+        title_tokens = set(_RELEVANCE_TOKEN_RE.findall((h.title or "").lower()))
+        if title_tokens & q_tokens:
+            kept.append(h)
+    return kept
+
+
 # --------------------------------------------------------------------------
 # public entry point
 # --------------------------------------------------------------------------
@@ -513,7 +562,9 @@ def aggregate_search(
         for name, fn in fetchers:
             all_hits.extend(_safe(name, fn))
 
-    return _rank(_dedup(all_hits))[:max_results]
+    deduped = _dedup(all_hits)
+    filtered = _drop_irrelevant_singletons(deduped, query)
+    return _rank(filtered)[:max_results]
 
 
 # --------------------------------------------------------------------------

@@ -29,6 +29,15 @@ from paper_cache import CachedAuthor, CachedPaper
 
 CHEMRXIV_DOI_PREFIX = "10.26434"
 
+# Known degenerate Crossref/OpenAlex "abstract" strings for ChemRxiv records —
+# these appear when the publisher only registered admin metadata and not the
+# real abstract. Matched case-insensitively against whitespace-collapsed text.
+_CHEMRXIV_ABSTRACT_SENTINELS = (
+    "publication status: published",
+    "publication status: submitted",
+    "publication status: pending",
+)
+
 
 def is_chemrxiv_doi(doi: str) -> bool:
     return doi.lower().startswith(f"{CHEMRXIV_DOI_PREFIX}/")
@@ -111,12 +120,77 @@ def _pdf_url_from_crossref(item: dict) -> str:
     return ""
 
 
+def _abstract_is_degenerate(abstract: str | None) -> bool:
+    """True when an abstract is empty or a known admin-metadata sentinel.
+
+    ChemRxiv's Crossref record sometimes has ``<jats:p>Publication status:
+    Published</jats:p>`` instead of the real abstract — treat those as if
+    no abstract exists so callers can recover from the peer-reviewed twin.
+    """
+    if not abstract:
+        return True
+    collapsed = re.sub(r"\s+", " ", abstract).strip().lower()
+    if len(collapsed) < 50:
+        return True
+    return any(s in collapsed for s in _CHEMRXIV_ABSTRACT_SENTINELS)
+
+
+def _abstract_from_published_twin(msg: dict) -> str:
+    """Recover the real abstract from the peer-reviewed DOI.
+
+    ChemRxiv records expose ``relation.is-preprint-of`` pointing at the
+    published-version DOI. That DOI typically has a proper Crossref
+    abstract (JATS) or an OpenAlex inverted-index abstract — either beats
+    the preprint's empty/sentinel abstract.
+    """
+    relation = msg.get("relation") or {}
+    targets = relation.get("is-preprint-of") or []
+    for t in targets:
+        if (t.get("id-type") or "").lower() != "doi":
+            continue
+        twin_doi = (t.get("id") or "").strip()
+        if not twin_doi:
+            continue
+        twin_msg = fetch_crossref_work(twin_doi)
+        twin_abs = (twin_msg or {}).get("abstract") or ""
+        if twin_abs:
+            cleaned = re.sub(r"</?[^>]+>", "", twin_abs).strip()
+            if cleaned and not _abstract_is_degenerate(cleaned):
+                return cleaned
+        # Crossref had nothing useful — try OpenAlex for the twin.
+        oa_abs = _openalex_abstract_for_doi(twin_doi)
+        if oa_abs and not _abstract_is_degenerate(oa_abs):
+            return oa_abs
+    return ""
+
+
+def _openalex_abstract_for_doi(doi: str) -> str:
+    """Reconstruct OpenAlex's inverted-index abstract for a DOI, or ''."""
+    from lit.config import OPENALEX_API_BASE
+    from lit.sources.openalex import _openalex_params, _reconstruct_abstract
+
+    url = f"{OPENALEX_API_BASE}/works/doi:{doi.lower()}"
+    try:
+        resp = _request_with_retry(
+            requests.get,
+            url,
+            service="openalex",
+            params=_openalex_params(select="abstract_inverted_index"),
+            timeout=15,
+        )
+        data = resp.json()
+    except requests.RequestException:
+        return ""
+    return _reconstruct_abstract(data.get("abstract_inverted_index")) or ""
+
+
 def _fetch_paper_chemrxiv(doi: str) -> CachedPaper | None:
     """Full metadata for a ChemRxiv DOI via Crossref.
 
-    Abstract is best-effort from Crossref; callers that want reliable
-    abstracts should let the outer DOI dispatch hit OpenAlex first and
-    fall back here.
+    Abstract fallback chain: Crossref preprint abstract → published-twin
+    (``relation.is-preprint-of``) Crossref abstract → published-twin
+    OpenAlex abstract. The twin lookup only runs when the preprint abstract
+    is empty or matches a known ChemRxiv admin-metadata sentinel.
     """
     msg = fetch_crossref_work(doi)
     if not msg:
@@ -133,6 +207,8 @@ def _fetch_paper_chemrxiv(doi: str) -> CachedPaper | None:
     abs_raw = msg.get("abstract")
     if abs_raw:
         abstract = re.sub(r"</?[^>]+>", "", abs_raw).strip()
+    if _abstract_is_degenerate(abstract):
+        abstract = _abstract_from_published_twin(msg) or abstract
 
     year_str = _crossref_year(msg)
     year = int(year_str) if year_str.isdigit() else None
