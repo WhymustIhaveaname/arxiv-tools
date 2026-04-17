@@ -474,6 +474,38 @@ def _resolve_pmcid_or_die(pmcid: str) -> str:
     return pmid
 
 
+# S2 / OpenAlex paper_spec prefix (capital-A ArXiv) and user-facing display prefix
+# (lowercase-a arXiv) for each ID type. Keep these in lockstep with the fetchers
+# in lit/sources/{s2,openalex}.py.
+_XREF_ID_PREFIXES = {
+    "arxiv": ("ArXiv:", "arXiv:"),
+    "pmid":  ("PMID:",  "PMID:"),
+    "doi":   ("DOI:",   "DOI:"),
+}
+
+
+def _resolve_xref_id(raw_id: str) -> tuple[str, str, str, str]:
+    """Shared ID resolution for ``cited`` / ``references``.
+
+    Parses ``raw_id``, resolves PMC IDs to their PMID via NCBI ELink, and
+    returns ``(paper_spec, display_id, id_type, clean_id)``. Exits non-zero
+    on unsupported identifiers (keywords, unknown formats).
+    """
+    id_type, clean_id = extract_paper_id(raw_id)
+    if id_type == "pmcid":
+        clean_id = _resolve_pmcid_or_die(clean_id)
+        id_type = "pmid"
+    if id_type not in _XREF_ID_PREFIXES:
+        print(
+            f"Unrecognised identifier '{raw_id}' — supported: arXiv ID, "
+            f"PMID, PMC ID, DOI.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    spec_pfx, disp_pfx = _XREF_ID_PREFIXES[id_type]
+    return f"{spec_pfx}{clean_id}", f"{disp_pfx}{clean_id}", id_type, clean_id
+
+
 def cmd_info(args):
     """Display paper metadata from a parallel multi-source lookup.
 
@@ -638,29 +670,7 @@ def cmd_bib(args):
 
 
 def cmd_cited(args):
-    id_type, clean_id = extract_paper_id(args.arxiv_id)
-
-    if id_type == "pmcid":
-        clean_id = _resolve_pmcid_or_die(clean_id)
-        id_type = "pmid"
-
-    if id_type == "arxiv":
-        paper_spec = f"ArXiv:{clean_id}"
-        display_id = f"arXiv:{clean_id}"
-    elif id_type == "pmid":
-        paper_spec = f"PMID:{clean_id}"
-        display_id = f"PMID:{clean_id}"
-    elif id_type == "doi":
-        paper_spec = f"DOI:{clean_id}"
-        display_id = f"DOI:{clean_id}"
-    else:
-        print(
-            f"Unrecognised identifier '{args.arxiv_id}' — supported: arXiv ID, "
-            f"PMID, PMC ID, DOI.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
+    paper_spec, display_id, _id_type, _clean_id = _resolve_xref_id(args.arxiv_id)
     source = args.source
     offset = args.offset
     results = None
@@ -817,26 +827,7 @@ def cmd_references(args):
     Tries S2 first (covers every ID type, returns rich metadata in one shot).
     Falls back to PubMed ELink for PMIDs when S2 has no reference data.
     """
-    id_type, clean_id = extract_paper_id(args.arxiv_id)
-
-    if id_type == "pmcid":
-        clean_id = _resolve_pmcid_or_die(clean_id)
-        id_type = "pmid"
-
-    if id_type == "arxiv":
-        paper_spec, display_id = f"ArXiv:{clean_id}", f"arXiv:{clean_id}"
-    elif id_type == "pmid":
-        paper_spec, display_id = f"PMID:{clean_id}", f"PMID:{clean_id}"
-    elif id_type == "doi":
-        paper_spec, display_id = f"DOI:{clean_id}", f"DOI:{clean_id}"
-    else:
-        print(
-            f"Unrecognised identifier '{args.arxiv_id}' — supported: arXiv ID, "
-            f"PMID, PMC ID, DOI.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
+    paper_spec, display_id, id_type, clean_id = _resolve_xref_id(args.arxiv_id)
     offset = args.offset
     print(f"Querying Semantic Scholar: {paper_spec}")
     ret = _fetch_references_s2_spec(paper_spec, args.max, offset)
@@ -1038,6 +1029,19 @@ def _fetch_chemrxiv_to_disk(doi: str) -> None:
     )
 
 
+def _biorxiv_site_and_landing(doi: str) -> tuple[str, str]:
+    """Guess the ``biorxiv`` vs ``medrxiv`` subdomain for a 10.1101 DOI.
+
+    They share the DOI prefix but live on different subdomains; we infer
+    from any cached OpenAlex ``pdf_url`` and default to bioRxiv. Returns
+    ``(site, landing_pdf_url)``.
+    """
+    cached = get_cached_paper(f"doi:{doi.lower()}")
+    is_medrxiv = "medrxiv" in ((cached.pdf_url if cached else "") or "").lower()
+    site = "medrxiv" if is_medrxiv else "biorxiv"
+    return site, f"https://www.{site}.org/content/{doi}.full.pdf"
+
+
 def _try_biorxiv_to_disk(doi: str) -> bool:
     """bioRxiv / medRxiv layered chain. Returns True on first success.
 
@@ -1046,8 +1050,6 @@ def _try_biorxiv_to_disk(doi: str) -> bool:
     special-cased: if a PMC copy exists, we delegate to the PMC chain
     (JATS / BioC / PDF) entirely, since structured XML beats Playwright.
     """
-    from lit.sources.europepmc import _fetch_paper_europepmc_by_doi
-
     safe = doi.lower().replace("/", "_")
     if _already_saved(safe, "pdf", "txt"):
         return True
@@ -1060,9 +1062,7 @@ def _try_biorxiv_to_disk(doi: str) -> bool:
         and "medrxiv" not in cached.pdf_url.lower()
         else None
     )
-    is_medrxiv = "medrxiv" in ((cached.pdf_url if cached else "") or "").lower()
-    site = "medrxiv" if is_medrxiv else "biorxiv"
-    landing = f"https://www.{site}.org/content/{doi}.full.pdf"
+    site, landing = _biorxiv_site_and_landing(doi)
     warmup = f"https://www.{site}.org/content/{doi}"
 
     def _try_europepmc_pmc() -> bool:
@@ -1091,10 +1091,7 @@ def _try_biorxiv_to_disk(doi: str) -> bool:
 def _fetch_biorxiv_to_disk(doi: str) -> None:
     if _try_biorxiv_to_disk(doi):
         return
-    cached = get_cached_paper(f"doi:{doi.lower()}")
-    is_medrxiv = "medrxiv" in ((cached.pdf_url if cached else "") or "").lower()
-    site = "medrxiv" if is_medrxiv else "biorxiv"
-    landing = f"https://www.{site}.org/content/{doi}.full.pdf"
+    _, landing = _biorxiv_site_and_landing(doi)
     _fail_fulltext(
         f"All automatic full-text paths failed for {doi}.\n"
         f"Open this URL in a real browser to download:\n  {landing}"

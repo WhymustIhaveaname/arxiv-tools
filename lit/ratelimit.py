@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import random
 import sys
 import time
 
@@ -57,7 +58,9 @@ class RateLimiter:
 
     @classmethod
     def backoff(cls, service: str, attempt: int) -> float:
-        return cls.INTERVALS[service] * (2 ** attempt)
+        # ±20% jitter so parallel workers don't retry in lockstep after a
+        # shared 429 / 5xx. Multiplier stays in [0.8, 1.2] of the nominal gap.
+        return cls.INTERVALS[service] * (2 ** attempt) * random.uniform(0.8, 1.2)
 
     @classmethod
     def acquire(cls, service: str) -> None:

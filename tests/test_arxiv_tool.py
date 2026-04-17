@@ -1943,9 +1943,13 @@ class TestRateLimiter:
         assert time.time() - start < 0.1
 
     def test_backoff_formula(self):
-        assert arxiv_tool.RateLimiter.backoff("ut", 0) == 0.3
-        assert arxiv_tool.RateLimiter.backoff("ut", 1) == 0.6
-        assert arxiv_tool.RateLimiter.backoff("ut", 2) == 1.2
+        # Nominal backoff is INTERVALS[service] * 2**attempt, with ±20% jitter
+        # applied so parallel workers don't synchronise retries after a shared
+        # 429. Assert the jittered value lands in [0.8x, 1.2x] of nominal.
+        for attempt, nominal in [(0, 0.3), (1, 0.6), (2, 1.2)]:
+            for _ in range(20):
+                v = arxiv_tool.RateLimiter.backoff("ut", attempt)
+                assert nominal * 0.8 <= v <= nominal * 1.2
 
     def test_corrupt_lock_file_auto_recovers(self):
         """损坏的 lock 文件不阻断 acquire"""

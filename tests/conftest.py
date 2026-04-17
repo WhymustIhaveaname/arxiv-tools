@@ -9,6 +9,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
+def pytest_configure(config):
+    """Register custom markers so ``-m "not network"`` doesn't warn."""
+    config.addinivalue_line(
+        "markers",
+        "network: tests that hit real external APIs (deselect with -m 'not network')",
+    )
+
+
 @pytest.fixture()
 def cache_db(tmp_path):
     """Per-test isolated SQLite cache. Without this fixture tests would write
