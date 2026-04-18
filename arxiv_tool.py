@@ -46,10 +46,12 @@ from lit.config import (
     CACHE_DIR,
     CONTACT_EMAIL,
     HTTP_HEADERS,
+    MANUAL_PDF_DIR,
     OPENALEX_API_BASE,
     OPENALEX_API_KEY,
     S2_API_BASE,
     S2_API_KEY,
+    WORK_DIR,
 )
 from lit.ids import (
     _arxiv_date,
@@ -113,6 +115,7 @@ from lit.sources.arxiv_api import (
 from lit.sources.europepmc import (
     ANNOTATION_TYPE_MAP,
     _fetch_paper_europepmc_by_doi,
+    pmc_full_text_locator,
     _normalize_europepmc_search,
     _search_europepmc,
     fetch_annotations,
@@ -1120,15 +1123,26 @@ def _try_europepmc_pmc_for_doi(doi: str) -> bool:
 
     Many OA-published Wiley/Nature/Cell/JACS articles sit in PMC with full
     JATS XML; using that avoids the publisher paywall entirely.
+
+    Skips the PMC chain when Europe PMC reports ``isOpenAccess=N``: in that
+    case the PMCID is just an abstract-index entry and every JATS/BioC
+    fetch 404s, so we let the caller fall through to OA mirrors instead.
     """
-    epmc = _fetch_paper_europepmc_by_doi(doi)
-    if not (epmc and epmc.pmcid):
+    pmcid, is_oa = pmc_full_text_locator(doi)
+    if not pmcid:
+        return False
+    if not is_oa:
+        print(
+            f"  Europe PMC has {pmcid} for this DOI but isOpenAccess=N; "
+            f"skipping PMC chain (full text not available).",
+            file=sys.stderr,
+        )
         return False
     print(
-        f"  Europe PMC has {epmc.pmcid} for this DOI; using PMC chain.",
+        f"  Europe PMC has {pmcid} for this DOI; using PMC chain.",
         file=sys.stderr,
     )
-    return _try_pmc_to_disk(epmc.pmcid)
+    return _try_pmc_to_disk(pmcid)
 
 
 def _try_generic_doi_to_disk(doi: str) -> bool:
@@ -1298,16 +1312,29 @@ def cmd_fulltext_batch(args):
     manifest_path = (
         Path(args.manifest).expanduser().resolve()
         if args.manifest
-        else OUTPUT_DIR / "fulltext_failed.tsv"
+        else WORK_DIR / "fulltext_failed.tsv"
     )
-    run_batch(ids_path, try_fetch=_try_fulltext_for_id, manifest_path=manifest_path)
+    MANUAL_PDF_DIR.mkdir(parents=True, exist_ok=True)
+    run_batch(
+        ids_path,
+        try_fetch=_try_fulltext_for_id,
+        manifest_path=manifest_path,
+        download_me_path=WORK_DIR / "download_me.txt",
+        manual_pdf_dir=MANUAL_PDF_DIR,
+    )
 
 
 def cmd_fulltext_import(args):
     """Scan a directory for manually-downloaded PDFs and ingest each."""
-    pdf_dir = Path(args.pdf_dir).expanduser().resolve()
+    pdf_dir = (
+        Path(args.pdf_dir).expanduser().resolve()
+        if args.pdf_dir
+        else MANUAL_PDF_DIR
+    )
     manifest_path = (
-        Path(args.manifest).expanduser().resolve() if args.manifest else None
+        Path(args.manifest).expanduser().resolve()
+        if args.manifest
+        else (WORK_DIR / "fulltext_failed.tsv" if (WORK_DIR / "fulltext_failed.tsv").exists() else None)
     )
     run_import(pdf_dir, OUTPUT_DIR, manifest_path=manifest_path)
 
@@ -1468,11 +1495,19 @@ def main():
         help="批量导入手动下载的 PDF: 扫目录, 按 manifest / 文件名匹配 ID, 入缓存",
     )
     import_parser.add_argument(
-        "pdf_dir", help="包含 *.pdf 的目录, 文件名建议跟 manifest 的 basename 一致",
+        "pdf_dir", nargs="?", default=None,
+        help=(
+            "包含 *.pdf 的目录. 省略时默认用 $ARXIV_WORK_DIR/manual-pdfs (即 "
+            "fulltext-batch 指引你上传的那个目录). 文件名不用改, 工具先从 PDF "
+            "内容里认 DOI, 认不出才退回去看文件名"
+        ),
     )
     import_parser.add_argument(
         "--manifest", metavar="PATH",
-        help="fulltext-batch 产出的 TSV; 用于按 basename 精准匹配. 不给也能跑 (会用文件名启发式)",
+        help=(
+            "fulltext-batch 产出的 TSV; 省略时自动用 $ARXIV_WORK_DIR/fulltext_failed.tsv "
+            "(如果存在). manifest 只用于 basename 兜底匹配, 主匹配靠 PDF 内容"
+        ),
     )
     import_parser.set_defaults(func=cmd_fulltext_import)
 

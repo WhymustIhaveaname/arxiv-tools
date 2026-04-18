@@ -25,6 +25,7 @@ JS, neither of which we want to save as a .pdf file.
 
 from __future__ import annotations
 
+import html
 import sys
 
 import requests
@@ -107,10 +108,11 @@ def _core_urls(doi: str) -> list[str]:
         # downloadUrl is often empty or a generic repo landing page for
         # paywalled papers; sourceFulltextUrls is the curated PDF list.
         for u in r.get("sourceFulltextUrls") or []:
+            u = html.unescape((u or "").strip())
             if u and u not in urls:
                 urls.append(u)
         for fld in ("downloadUrl", "fullTextLink"):
-            u = (r.get(fld) or "").strip()
+            u = html.unescape((r.get(fld) or "").strip())
             if u and u not in urls:
                 urls.append(u)
     return urls
@@ -187,5 +189,12 @@ def try_download_pdf(url: str, *, timeout: int = 60) -> bytes | None:
         return None
 
     if not is_pdf_bytes(resp.content):
+        ctype = (resp.headers.get("Content-Type") or "?").split(";", 1)[0].strip()
+        size = len(resp.content)
+        print(
+            f"OA mirror returned non-PDF body ({url[:60]}...): "
+            f"HTTP {resp.status_code} {ctype} {size}B",
+            file=sys.stderr,
+        )
         return None
     return resp.content

@@ -11,6 +11,7 @@ Endpoint docs: https://www.ncbi.nlm.nih.gov/research/bionlp/APIs/BioC-PMC/
 
 from __future__ import annotations
 
+import json
 import sys
 
 import requests
@@ -46,6 +47,12 @@ def fetch_pmc_bioc_json(pmcid: str) -> str | None:
         return None
 
     body = resp.text or ""
-    if not body.strip().startswith("["):
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(parsed, list) or not parsed or not isinstance(parsed[0], dict):
+        return None
+    if not parsed[0].get("documents"):
         return None
     return body

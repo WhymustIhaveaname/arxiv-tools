@@ -1,6 +1,7 @@
 .env
 .venv/
 /.arxiv/
+/.work/
 *.pyc
 __pycache__/
 .ratelimit.lock

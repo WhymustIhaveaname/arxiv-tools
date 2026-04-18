@@ -225,6 +225,16 @@ def _fetch_paper_europepmc_by_doi(doi: str) -> CachedPaper | None:
     Great for preprints whose DOI is the primary identifier (bioRxiv's
     10.1101/…, medRxiv's 10.1101/…, Research Square's 10.21203/…).
     """
+    r = _fetch_raw_europepmc_by_doi(doi)
+    return _record_to_cached_paper(r) if r else None
+
+
+def _fetch_raw_europepmc_by_doi(doi: str) -> dict | None:
+    """Internal: return the raw Europe PMC result record for a DOI.
+
+    Used when callers need fields not in CachedPaper (e.g. ``isOpenAccess``,
+    ``inPMC``) to make retrieval decisions.
+    """
     url = f"{EUROPEPMC_API_BASE}/search"
     try:
         resp = _request_with_retry(
@@ -241,9 +251,23 @@ def _fetch_paper_europepmc_by_doi(doi: str) -> CachedPaper | None:
         return None
 
     items = (data.get("resultList") or {}).get("result") or []
-    if not items:
-        return None
-    return _record_to_cached_paper(items[0])
+    return items[0] if items else None
+
+
+def pmc_full_text_locator(doi: str) -> tuple[str | None, bool]:
+    """Return ``(pmcid, is_oa_full_text)`` for a DOI.
+
+    Europe PMC happily returns a PMCID for papers that are only abstract-
+    indexed (``inPMC=Y`` but ``isOpenAccess=N``); those PMCIDs then 404 on
+    every JATS/BioC fetch. Callers use ``is_oa_full_text`` to skip the PMC
+    chain and jump straight to OA mirrors.
+    """
+    r = _fetch_raw_europepmc_by_doi(doi)
+    if not r:
+        return None, False
+    pmcid = r.get("pmcid") or None
+    is_oa = (r.get("isOpenAccess") or "").upper() == "Y"
+    return pmcid, is_oa
 
 
 def _record_to_cached_paper(r: dict) -> CachedPaper:

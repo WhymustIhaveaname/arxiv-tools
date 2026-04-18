@@ -184,6 +184,17 @@ Site-specific hints (domain knowledge you won't find in Playwright docs):
   the user: the landing URL you tried, what the page showed (login wall
   vs CF challenge vs 404), and any OA alternatives the page links to
   (preprint, institutional repo, author homepage).
+- WAF hard-blocks (fast-fail, don't retry): if the page shows
+  "There was a problem providing the content you requested" (Elsevier /
+  ScienceDirect), a persistent Cloudflare "Just a moment..." that does
+  not clear after ~30 s, or an outright HTTP 403 on a plain GET of the
+  landing URL, the server's egress IP is WAF-blacklisted. Playwright MCP
+  cannot solve this. Stop after one attempt per site — do not retry from
+  a fresh tab or with a different UA, it will not help. Surface the
+  failure with a one-line "IP-level block by <publisher>; manual
+  download from a different network required" and move on to the next
+  paper; the user will use `fulltext-import` to ingest manual copies
+  later.
 
 <example>
 Handoff for a ChemRxiv DOI:

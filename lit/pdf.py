@@ -9,10 +9,67 @@ control where files land — ``arxiv_tool.py`` passes its module-level
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
 import fitz  # PyMuPDF
+
+
+# DOI pattern per Crossref guidance: 10. followed by a 4-9 digit registrant,
+# slash, then any non-space characters. We trim trailing punctuation that
+# commonly rides along in text (periods, commas, parens) after matching.
+_DOI_RE = re.compile(r"\b10\.\d{4,9}/[^\s\"'<>]+", re.IGNORECASE)
+
+
+def _normalize_doi(raw: str) -> str:
+    """Strip surrounding noise from a candidate DOI string."""
+    raw = raw.strip().rstrip(".,;)]}>")
+    # Strip a trailing citation marker like "doi:10.xxx/foo." that occasionally
+    # hangs off URL-encoded DOIs in PDF metadata.
+    return raw.lower()
+
+
+def extract_doi_from_pdf(pdf_bytes: bytes) -> str | None:
+    """Best-effort DOI recovery from a PDF's own content.
+
+    Source order (publisher-provided metadata is the most reliable):
+
+    1. PyMuPDF document metadata (``/Subject``, ``/Keywords``, ``/Title``,
+       and the rare ``/doi`` key). Many Elsevier / Nature / Springer /
+       AAAS PDFs embed the DOI here.
+    2. First-page plain text — typical "Cite this article" / "Available
+       online at https://doi.org/..." strings sit near the top.
+
+    Returns the lowercased DOI string (e.g. ``"10.1038/s41586-025-08800-x"``)
+    or ``None`` when nothing parseable is found.
+    """
+    if not is_pdf_bytes(pdf_bytes):
+        return None
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        return None
+    try:
+        meta = doc.metadata or {}
+        for key in ("doi", "Doi", "DOI", "subject", "Subject", "keywords", "Keywords", "title", "Title"):
+            val = meta.get(key) or ""
+            m = _DOI_RE.search(val)
+            if m:
+                return _normalize_doi(m.group(0))
+
+        # First page only — DOI is conventionally on the title page header,
+        # and scanning the whole document is both slower and noisier.
+        try:
+            first_page = doc[0].get_text() if doc.page_count else ""
+        except Exception:
+            first_page = ""
+        m = _DOI_RE.search(first_page)
+        if m:
+            return _normalize_doi(m.group(0))
+    finally:
+        doc.close()
+    return None
 
 
 def is_pdf_bytes(data: bytes | None) -> bool:

@@ -230,3 +230,143 @@ class TestRunImport:
         out_dir = tmp_path / "out"
         imported, skipped = run_import(tmp_path / "no-such-dir", out_dir)
         assert imported == 0 and skipped == 0
+
+    def test_pdf_content_doi_beats_filename(self, tmp_path):
+        """Filename is garbage; DOI in PDF content is what matters."""
+        pdf_dir = tmp_path / "downloads"
+        pdf_dir.mkdir()
+        out_dir = tmp_path / "out"
+        _write_pdf(pdf_dir / "untitled_download.pdf")
+
+        with patch(
+            "lit.batch.extract_doi_from_pdf",
+            return_value="10.1038/s41586-025-08800-x",
+        ), patch("lit.batch.ingest_local_pdf") as mock_ingest:
+            imported, skipped = run_import(pdf_dir, out_dir)
+        assert imported == 1 and skipped == 0
+        assert mock_ingest.call_args.args[1] == "10.1038_s41586-025-08800-x"
+
+    def test_already_cached_basename_is_skipped(self, tmp_path):
+        """Dropping the same PDF twice must not overwrite cached structured data."""
+        pdf_dir = tmp_path / "downloads"
+        pdf_dir.mkdir()
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        _write_pdf(pdf_dir / "paper.pdf")
+        # Simulate pre-existing richer cache entry (JATS XML).
+        (out_dir / "10.1038_x.xml").write_text("<jats>...")
+
+        with patch(
+            "lit.batch.extract_doi_from_pdf", return_value="10.1038/x"
+        ), patch("lit.batch.ingest_local_pdf") as mock_ingest:
+            imported, skipped = run_import(pdf_dir, out_dir)
+        assert imported == 0 and skipped == 1
+        mock_ingest.assert_not_called()
+
+    def test_non_pdf_file_skipped(self, tmp_path):
+        """Files without %PDF magic must never be ingested."""
+        pdf_dir = tmp_path / "downloads"
+        pdf_dir.mkdir()
+        out_dir = tmp_path / "out"
+        (pdf_dir / "not_a_pdf.pdf").write_bytes(b"<html>error</html>")
+
+        with patch("lit.batch.ingest_local_pdf") as mock_ingest:
+            imported, skipped = run_import(pdf_dir, out_dir)
+        assert imported == 0 and skipped == 1
+        mock_ingest.assert_not_called()
+
+    def test_manifest_suffix_match_for_publisher_native_filename(self, tmp_path):
+        """AAAS / Elsevier drop the DOI prefix in native filenames."""
+        pdf_dir = tmp_path / "downloads"
+        pdf_dir.mkdir()
+        out_dir = tmp_path / "out"
+        manifest = tmp_path / "m.tsv"
+        _write_pdf(pdf_dir / "scisignal.ado6430.pdf")
+        with manifest.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=MANIFEST_COLUMNS, delimiter="\t")
+            w.writeheader()
+            w.writerow({
+                "id": "10.1126/scisignal.ado6430", "id_type": "doi",
+                "basename": "10.1126_scisignal.ado6430",
+                "url_to_try": "https://doi.org/10.1126/scisignal.ado6430",
+                "reason": "exhausted",
+            })
+
+        with patch("lit.batch.extract_doi_from_pdf", return_value=None), \
+             patch("lit.batch.ingest_local_pdf") as mock_ingest:
+            imported, skipped = run_import(pdf_dir, out_dir, manifest_path=manifest)
+        assert imported == 1 and skipped == 0
+        assert mock_ingest.call_args.args[1] == "10.1126_scisignal.ado6430"
+
+    def test_ingested_pdf_removed_from_staging(self, tmp_path):
+        """After successful ingest the staged copy is cleaned up."""
+        pdf_dir = tmp_path / "downloads"
+        pdf_dir.mkdir()
+        out_dir = tmp_path / "out"
+        src = pdf_dir / "10.1038_x.pdf"
+        _write_pdf(src)
+
+        with patch("lit.batch.extract_doi_from_pdf", return_value=None), \
+             patch("lit.batch.ingest_local_pdf"):
+            run_import(pdf_dir, out_dir)
+        assert not src.exists()
+
+
+class TestDownloadMeFile:
+    def test_written_on_failure(self, tmp_path):
+        ids = tmp_path / "ids.txt"
+        ids.write_text("10.1038/a\n10.1038/b\n")
+        manifest = tmp_path / "m.tsv"
+        download_me = tmp_path / "download_me.txt"
+        drop = tmp_path / "drops"
+
+        run_batch(
+            ids,
+            try_fetch=lambda *_: False,
+            manifest_path=manifest,
+            download_me_path=download_me,
+            manual_pdf_dir=drop,
+        )
+        text = download_me.read_text()
+        assert "https://doi.org/10.1038/a" in text
+        assert "https://doi.org/10.1038/b" in text
+        assert "scp" in text
+        assert str(drop) in text
+        assert "fulltext-import" in text
+
+    def test_not_written_when_all_succeed(self, tmp_path):
+        ids = tmp_path / "ids.txt"
+        ids.write_text("10.1038/a\n")
+        manifest = tmp_path / "m.tsv"
+        download_me = tmp_path / "download_me.txt"
+        drop = tmp_path / "drops"
+
+        run_batch(
+            ids,
+            try_fetch=lambda *_: True,
+            manifest_path=manifest,
+            download_me_path=download_me,
+            manual_pdf_dir=drop,
+        )
+        assert not download_me.exists()
+
+    def test_stale_artefacts_cleaned_on_all_success(self, tmp_path):
+        """Re-running batch after everything's cached must wipe old manifest/guide."""
+        ids = tmp_path / "ids.txt"
+        ids.write_text("10.1038/a\n")
+        manifest = tmp_path / "m.tsv"
+        download_me = tmp_path / "download_me.txt"
+        drop = tmp_path / "drops"
+        # Seed stale artefacts from a prior (failed) run.
+        manifest.write_text("stale manifest")
+        download_me.write_text("stale download guide")
+
+        run_batch(
+            ids,
+            try_fetch=lambda *_: True,
+            manifest_path=manifest,
+            download_me_path=download_me,
+            manual_pdf_dir=drop,
+        )
+        assert not manifest.exists()
+        assert not download_me.exists()

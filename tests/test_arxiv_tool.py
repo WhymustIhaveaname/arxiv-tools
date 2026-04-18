@@ -639,6 +639,8 @@ class TestOAMirror:
 
         class R:
             content = b"<!DOCTYPE html>...<title>Just a moment...</title>"
+            status_code = 200
+            headers = {"Content-Type": "text/html; charset=utf-8"}
             def raise_for_status(self): pass
 
         with patch("lit.oa_mirror._request_with_retry", return_value=R()):
