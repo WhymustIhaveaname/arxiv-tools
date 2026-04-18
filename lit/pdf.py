@@ -1,6 +1,6 @@
 """PDF utilities: magic-byte validation, text extraction, save-with-text, manual ingest.
 
-Centralised here so every full-text path (arXiv, PMC, OA mirror, shadow, manual)
+Centralised here so every full-text path (arXiv, PMC, OA mirror, manual)
 shares one ``%PDF`` check, one PyMuPDF wrapper, one save layout, and one
 ``--from-file`` ingest. Functions take ``output_dir`` explicitly so callers
 control where files land — ``arxiv_tool.py`` passes its module-level

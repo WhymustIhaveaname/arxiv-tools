@@ -49,10 +49,6 @@ class RateLimiter:
         "core": 6.5,
         # Generic OA mirror PDF download (random third-party hosts).
         "oa_mirror": 0.5,
-        # Shadow libraries — keep conservative to avoid mirror IP blocks.
-        # Anna's & Sci-Hub are unstable and easy to overload.
-        "annas": 3.0,
-        "scihub": 3.0,
         "ut": 0.3,
     }
 

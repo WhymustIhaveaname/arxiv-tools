@@ -1,6 +1,6 @@
 # Arxiv Tools
 
-给 agent 用的跨学科文献工具。覆盖 **arXiv / PubMed / PubMed Central / Europe PMC / ChemRxiv / Semantic Scholar / OpenAlex / Crossref / CORE**, 加 **Anna's Archive + Sci-Hub** 兜底。叫 arxiv_tools 只是因为我们从 arXiv 开始。
+给 agent 用的跨学科文献工具。覆盖 arXiv / PubMed / PubMed Central / Europe PMC / ChemRxiv / Semantic Scholar / OpenAlex / Crossref / CORE。叫 arxiv_tools 只是因为我们从 arXiv 开始。
 
 ## 子命令
 
@@ -35,8 +35,8 @@
 - **arxiv**: LaTeX 源码 → PDF fallback
 - **pmcid**: JATS XML → BioC JSON → PDF (LLM 友好度递降)
 - **pmid 有 PMC 副本**: PMC 链
-- **pmid 无 PMC**: preprint 反查 → OA mirror → shadow → 失败提示
-- **doi (chemrxiv/biorxiv/通用)**: 各自 layered chain (preprint 反查 → OA mirror → Playwright → shadow → 失败提示)
+- **pmid 无 PMC**: preprint 反查 → OA mirror → 失败时打印 landing URL, 让带 Playwright MCP 的 agent 接管
+- **doi (chemrxiv/biorxiv/通用)**: 各自 layered chain (PMC 副本 / preprint 反查 → OA mirror → 失败时打印 landing URL, agent 接管)
 - **`--from-file <path>`**: 任何 ID 都能用; 浏览器手动下后传给我们入库
 
 `fulltext-batch` 跑完会把失败的写到 TSV manifest, 用户浏览器下载后 `fulltext-import` 批量入库。
@@ -79,25 +79,12 @@ CONTACT_EMAIL=you@example.com # Crossref/Unpaywall polite pool 必需
 
 申请步骤详见 `~/notes/universal-literature-tool-plan.md` §5。
 
-### 4. Shadow library 配置 (可选)
-
-默认开启 Anna's Archive + Sci-Hub。域名经常变, 失败时改:
-
-```bash
-SHADOW_LIBRARIES=annas,scihub        # 留空可全关
-ANNAS_MIRROR=https://annas-archive.li
-SCIHUB_MIRROR=https://sci-hub.ru
-```
-
-注意 `annas-archive.ru` 是钓鱼域名, 不要用; 真域名只有 `.li/.gl/.se/.org`。
-
 ## 架构概览
 
 - `arxiv_tool.py` — CLI 入口 + 公开接口契约 (re-export); 业务逻辑在 `lit/` 包
 - `lit/aggregator.py` — 多源并行: `aggregate_search` (search) + `aggregate_lookup` (info), DOI/arXiv-ID/PMID/PMCID 去重 + 字段合并
 - `lit/preprint_lookup.py` — OpenAlex `locations` + S2 `externalIds` 反查 preprint 版本
-- `lit/shadow.py` — Anna's Archive SciDB + Sci-Hub fallback
-- `lit/oa_mirror.py` — Layer 1 OA: Unpaywall + OpenAlex + CORE + Crossref TDM
+- `lit/oa_mirror.py` — OA mirror 聚合: Unpaywall + OpenAlex + CORE + Crossref TDM
 - `lit/fetch.py` — `Layer` + `walk_layers` 通用分层调度
 - `lit/pdf.py` — PDF magic 校验 + PyMuPDF 文本提取 + save/ingest
 - `lit/batch.py` — `run_batch` (manifest TSV) + `run_import`

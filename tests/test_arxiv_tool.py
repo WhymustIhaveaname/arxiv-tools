@@ -656,21 +656,6 @@ class TestOAMirror:
         assert got is not None and got.startswith(b"%PDF")
 
 
-class TestBrowserModule:
-    """Soft-import behavior of lit/browser.py when Playwright is absent."""
-
-    def test_missing_playwright_returns_none(self, capsys):
-        from lit import browser
-
-        # Simulate Playwright not installed.
-        def _bad_import():
-            raise ImportError("no playwright")
-
-        with patch.object(browser, "_import_playwright_sync", return_value=None):
-            assert browser.browser_download_pdf("https://x") is None
-            assert browser.browser_download_via_click("https://x") is None
-
-
 class TestFulltextDispatch:
     """cmd_fulltext ID-type routing."""
 
@@ -678,15 +663,15 @@ class TestFulltextDispatch:
         return argparse.Namespace(arxiv_id=arxiv_id, from_file=from_file)
 
     def test_biorxiv_doi_routes_to_biorxiv_handler(self):
-        with patch("arxiv_tool._fetch_biorxiv_to_disk") as mock_bx, \
-             patch("arxiv_tool._fetch_chemrxiv_to_disk") as mock_cx:
+        with patch("arxiv_tool._try_biorxiv_to_disk", return_value=True) as mock_bx, \
+             patch("arxiv_tool._try_chemrxiv_to_disk") as mock_cx:
             arxiv_tool.cmd_fulltext(self._args("10.1101/2024.01.01.12345"))
             mock_bx.assert_called_once_with("10.1101/2024.01.01.12345")
             mock_cx.assert_not_called()
 
     def test_chemrxiv_doi_routes_to_chemrxiv_handler(self):
-        with patch("arxiv_tool._fetch_biorxiv_to_disk") as mock_bx, \
-             patch("arxiv_tool._fetch_chemrxiv_to_disk") as mock_cx:
+        with patch("arxiv_tool._try_biorxiv_to_disk") as mock_bx, \
+             patch("arxiv_tool._try_chemrxiv_to_disk", return_value=True) as mock_cx:
             arxiv_tool.cmd_fulltext(self._args("10.26434/chemrxiv-2024-abc"))
             mock_cx.assert_called_once_with("10.26434/chemrxiv-2024-abc")
             mock_bx.assert_not_called()
@@ -694,9 +679,9 @@ class TestFulltextDispatch:
     def test_from_file_bypasses_all_network_paths(self, tmp_path, cache_db):
         pdf = tmp_path / "paper.pdf"
         pdf.write_bytes(b"%PDF-1.4\n minimal \n%%EOF")
-        with patch("arxiv_tool._fetch_biorxiv_to_disk") as mock_bx, \
-             patch("arxiv_tool._fetch_chemrxiv_to_disk") as mock_cx, \
-             patch("arxiv_tool._fetch_pmc_to_disk") as mock_pmc:
+        with patch("arxiv_tool._try_biorxiv_to_disk") as mock_bx, \
+             patch("arxiv_tool._try_chemrxiv_to_disk") as mock_cx, \
+             patch("arxiv_tool._try_pmc_to_disk") as mock_pmc:
             # Sends through the --from-file path regardless of ID type.
             arxiv_tool.OUTPUT_DIR = tmp_path  # redirect save target
             arxiv_tool.cmd_fulltext(self._args("10.26434/foo", from_file=str(pdf)))

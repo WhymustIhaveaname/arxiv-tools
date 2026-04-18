@@ -65,11 +65,6 @@ from lit.bibtex import (
     generate_bibtex_pubmed,
     generate_citation_key,
 )
-from lit.browser import (
-    browser_download_pdf,
-    browser_download_via_click,
-    is_playwright_available,
-)
 from lit.aggregator import (
     DEFAULT_SOURCES as AGG_DEFAULT_SOURCES,
     DOMAIN_PRESETS as AGG_DOMAIN_PRESETS,
@@ -92,7 +87,6 @@ from lit.pdf import (
     save_pdf_and_text as _pdf_save,
 )
 from lit.preprint_lookup import PreprintVersion, find_preprint_versions
-from lit.shadow import try_shadow_libraries
 from lit.sources.chemrxiv import (
     _fetch_paper_chemrxiv,
     _normalize_chemrxiv_search,
@@ -963,33 +957,12 @@ def _try_pmc_to_disk(pmcid: str) -> bool:
     )
 
 
-def _fetch_pmc_to_disk(pmcid: str) -> None:
-    """Download PMC full text using a fallback chain of formats.
-
-    Order (best-for-LLM first):
-      1. JATS XML from Europe PMC — structured paragraphs, section/figure/table tags
-      2. BioC JSON from NCBI — passage sequence, slightly broader coverage (~3M OA)
-      3. PDF from pmc.ncbi.nlm.nih.gov + PyMuPDF text extraction — last resort
-
-    Each successful step writes a file under OUTPUT_DIR and stops. The PDF
-    path writes both the PDF itself and an adjacent .txt of extracted text so
-    Claude can read either. If every format fails, exits non-zero.
-    """
-    if _try_pmc_to_disk(pmcid):
-        return
-    _fail_fulltext(
-        f"No open-access full text available for {pmcid.upper()} "
-        f"(JATS, BioC, and PDF all failed). Paper may be closed-access or withdrawn."
-    )
-
-
 def _try_chemrxiv_to_disk(doi: str) -> bool:
     """ChemRxiv layered chain. Returns True on first success.
 
-    Order: OA mirror → direct chemrxiv.org → Playwright click-path →
-    Playwright direct-with-warmup → shadow libraries. Most layers fail
-    behind Cloudflare; the OA-mirror layer catches papers cross-posted
-    elsewhere and is the most reliable path in practice.
+    Order: OA mirror → direct chemrxiv.org. When both fail the publisher
+    landing page is typically Cloudflare-protected; the caller prints a
+    handoff message so an agent with Playwright MCP can take over.
     """
     safe = doi.lower().replace("/", "_")
     if _already_saved(safe, "pdf", "txt"):
@@ -1001,32 +974,14 @@ def _try_chemrxiv_to_disk(doi: str) -> bool:
         if cached and cached.pdf_url and "chemrxiv.org" not in cached.pdf_url
         else None
     )
-    article_url = f"https://chemrxiv.org/doi/full/{doi}"
-    landing_url = chemrxiv_pdf_url(doi) or article_url
 
     layers = [
-        Layer(f"[1/5] Trying OA mirrors for {doi}...",
+        Layer(f"[1/2] Trying OA mirrors for {doi}...",
               lambda: _try_oa_mirror_for_pdf(doi=doi, openalex_pdf_url=openalex_pdf)),
-        Layer("[2/5] Trying direct ChemRxiv PDF (likely Cloudflared)...",
+        Layer("[2/2] Trying direct ChemRxiv PDF (likely Cloudflared)...",
               lambda: fetch_chemrxiv_pdf(doi)),
-        Layer(f"[3/5] Trying browser click-path via {article_url[:80]}...",
-              lambda: browser_download_via_click(article_url)),
-        Layer(f"[4/5] Trying direct browser fetch of {landing_url[:80]}...",
-              lambda: browser_download_pdf(landing_url, warmup_url=article_url)),
-        Layer(f"[5/5] Trying shadow libraries for {doi}...",
-              lambda: try_shadow_libraries(doi)),
     ]
     return walk_layers(layers, basename=safe, output_dir=OUTPUT_DIR)
-
-
-def _fetch_chemrxiv_to_disk(doi: str) -> None:
-    if _try_chemrxiv_to_disk(doi):
-        return
-    landing_url = chemrxiv_pdf_url(doi) or f"https://chemrxiv.org/doi/full/{doi}"
-    _fail_fulltext(
-        f"All automatic full-text paths failed for {doi}.\n"
-        f"Open this URL in a real browser to download:\n  {landing_url}"
-    )
 
 
 def _biorxiv_site_and_landing(doi: str) -> tuple[str, str]:
@@ -1045,10 +1000,11 @@ def _biorxiv_site_and_landing(doi: str) -> tuple[str, str]:
 def _try_biorxiv_to_disk(doi: str) -> bool:
     """bioRxiv / medRxiv layered chain. Returns True on first success.
 
-    Order: Europe PMC PMC copy (some preprints have one) → OA mirror →
-    Playwright on landing page → shadow libraries. The first layer is
-    special-cased: if a PMC copy exists, we delegate to the PMC chain
-    (JATS / BioC / PDF) entirely, since structured XML beats Playwright.
+    Order: Europe PMC PMC copy (some preprints have one) → OA mirror.
+    First layer is special-cased: if a PMC copy exists, delegate to the
+    PMC chain (JATS / BioC / PDF) entirely, since structured XML beats
+    a scraped PDF. When both layers fail the caller prints a handoff so
+    an agent with Playwright MCP can take over.
     """
     safe = doi.lower().replace("/", "_")
     if _already_saved(safe, "pdf", "txt"):
@@ -1062,8 +1018,6 @@ def _try_biorxiv_to_disk(doi: str) -> bool:
         and "medrxiv" not in cached.pdf_url.lower()
         else None
     )
-    site, landing = _biorxiv_site_and_landing(doi)
-    warmup = f"https://www.{site}.org/content/{doi}"
 
     def _try_europepmc_pmc() -> bool:
         epmc = _fetch_paper_europepmc_by_doi(doi)
@@ -1076,26 +1030,12 @@ def _try_biorxiv_to_disk(doi: str) -> bool:
         return _try_pmc_to_disk(epmc.pmcid)
 
     layers = [
-        Layer(f"[1/4] Checking Europe PMC for a PMC copy of {doi}...",
+        Layer(f"[1/2] Checking Europe PMC for a PMC copy of {doi}...",
               _try_europepmc_pmc),
-        Layer(f"[2/4] Trying OA mirrors for {doi}...",
+        Layer(f"[2/2] Trying OA mirrors for {doi}...",
               lambda: _try_oa_mirror_for_pdf(doi=doi, openalex_pdf_url=openalex_pdf)),
-        Layer(f"[3/4] Trying headless browser on {landing}...",
-              lambda: browser_download_pdf(landing, warmup_url=warmup)),
-        Layer(f"[4/4] Trying shadow libraries for {doi}...",
-              lambda: try_shadow_libraries(doi)),
     ]
     return walk_layers(layers, basename=safe, output_dir=OUTPUT_DIR)
-
-
-def _fetch_biorxiv_to_disk(doi: str) -> None:
-    if _try_biorxiv_to_disk(doi):
-        return
-    _, landing = _biorxiv_site_and_landing(doi)
-    _fail_fulltext(
-        f"All automatic full-text paths failed for {doi}.\n"
-        f"Open this URL in a real browser to download:\n  {landing}"
-    )
 
 
 def _ingest_local_pdf(path_str: str, out_basename: str) -> None:
@@ -1197,49 +1137,129 @@ def _try_generic_doi_to_disk(doi: str) -> bool:
     Order: PMC cross-link (many OA journal articles have a PMC copy with
     clean JATS XML) → preprint reverse lookup (Nature/Cell/Science papers
     often have an arXiv/bioRxiv twin) → OA mirror (Unpaywall/OpenAlex/
-    CORE/Crossref) → shadow libraries. Manual ``--from-file`` is the
-    explicit escape hatch when every layer fails.
+    CORE/Crossref). Manual ``--from-file`` is the explicit escape hatch
+    when every layer fails; a calling agent with Playwright MCP can use
+    the printed landing URL to fetch paywalled content and re-ingest.
     """
     safe = doi.lower().replace("/", "_")
     if _already_saved(safe, "pdf", "txt"):
         return True
 
     layers = [
-        Layer(f"[1/4] Checking Europe PMC for a PMC copy of {doi}...",
+        Layer(f"[1/3] Checking Europe PMC for a PMC copy of {doi}...",
               lambda: _try_europepmc_pmc_for_doi(doi)),
-        Layer(f"[2/4] Looking for preprint versions of {doi}...",
+        Layer(f"[2/3] Looking for preprint versions of {doi}...",
               lambda: _try_preprint_layer(doi, safe)),
-        Layer(f"[3/4] Trying OA mirrors for {doi}...",
+        Layer(f"[3/3] Trying OA mirrors for {doi}...",
               lambda: _try_oa_mirror_for_pdf(doi=doi)),
-        Layer(f"[4/4] Trying shadow libraries for {doi}...",
-              lambda: try_shadow_libraries(doi)),
     ]
     return walk_layers(layers, basename=safe, output_dir=OUTPUT_DIR)
 
 
-def _fetch_generic_doi_to_disk(doi: str) -> None:
-    if _try_generic_doi_to_disk(doi):
-        return
-    _fail_fulltext(
-        f"No automatic full-text path worked for {doi}.\n"
-        f"Open https://doi.org/{doi} in a real browser, then re-run with "
-        f"`--from-file <path>` to import the downloaded PDF."
+def _try_pmid_to_disk(pmid: str) -> bool:
+    """PMID fallback chain: PMC copy → preprint reverse lookup → OA mirror."""
+    paper = get_paper_info_pubmed(pmid)
+    pmcid = paper.pmcid if paper and paper.pmcid else pmid_to_pmcid(pmid)
+    if pmcid and _try_pmc_to_disk(pmcid):
+        return True
+    doi = paper.doi if paper else None
+    if not doi:
+        return False
+    basename = basename_for_id("pmid", pmid)
+    print(
+        f"PMID:{pmid} has no PMC copy — walking DOI fallback chain...",
+        file=sys.stderr,
+    )
+    layers = [
+        Layer(f"[1/2] Looking for preprint versions of {doi}...",
+              lambda: _try_preprint_layer(doi, basename)),
+        Layer(f"[2/2] Trying OA mirrors for {doi}...",
+              lambda: _try_oa_mirror_for_pdf(doi=doi)),
+    ]
+    return walk_layers(layers, basename=basename, output_dir=OUTPUT_DIR)
+
+
+def _try_doi_to_disk(doi: str) -> bool:
+    """Route a DOI to chemrxiv / biorxiv / generic chain."""
+    if is_chemrxiv_doi(doi):
+        return _try_chemrxiv_to_disk(doi)
+    if _is_biorxiv_doi(doi):
+        return _try_biorxiv_to_disk(doi)
+    return _try_generic_doi_to_disk(doi)
+
+
+def _doi_landing_url(doi: str) -> str:
+    if is_chemrxiv_doi(doi):
+        return chemrxiv_pdf_url(doi) or f"https://chemrxiv.org/doi/full/{doi}"
+    if _is_biorxiv_doi(doi):
+        return _biorxiv_site_and_landing(doi)[1]
+    return f"https://doi.org/{doi}"
+
+
+def _agent_handoff_hint(clean_id: str, id_type: str, landing: str) -> str:
+    """Structured failure message inviting an agent with Playwright MCP to retake.
+
+    Printed verbatim to stderr when the automatic chain exhausts itself.
+    Parseable by a calling Claude: `Landing URL:` and `--from-file` are the
+    two affordances the agent needs to fetch the PDF with Playwright MCP
+    and re-ingest it via this tool.
+    """
+    return (
+        f"All automatic full-text paths failed for {clean_id}.\n"
+        f"Landing URL: {landing}\n"
+        f"If you are an agent with Playwright MCP available, fetch the PDF "
+        f"from the landing URL above (may require clicking through a "
+        f"Cloudflare challenge or publisher paywall), save it locally, then "
+        f"re-run `fulltext {clean_id} --from-file <path>` to ingest it."
     )
 
 
+# id_type → (try_fn returning bool, failure-hint builder).
+# try_fn is shared between cmd_fulltext (interactive) and fulltext-batch; the
+# hint is only consulted by cmd_fulltext on failure.
+_FULLTEXT_DISPATCH = {
+    "arxiv": (
+        _try_arxiv_to_disk,
+        lambda cid: (
+            f"Could not fetch full text for arXiv:{cid} — tex source and "
+            f"PDF fallback both failed."
+        ),
+    ),
+    "pmcid": (
+        _try_pmc_to_disk,
+        lambda cid: (
+            f"No open-access full text available for {cid.upper()} "
+            f"(JATS, BioC, and PDF all failed). "
+            f"Paper may be closed-access or withdrawn."
+        ),
+    ),
+    "pmid": (
+        _try_pmid_to_disk,
+        lambda cid: (
+            f"No full-text found for PMID:{cid} "
+            f"(no PMC copy, no preprint, no OA mirror)."
+        ),
+    ),
+    "doi": (
+        _try_doi_to_disk,
+        lambda cid: _agent_handoff_hint(cid, "doi", _doi_landing_url(cid)),
+    ),
+}
+
+
+def _try_fulltext_for_id(id_type: str, clean_id: str) -> bool:
+    """Try-dispatch used by ``fulltext-batch``; never exits."""
+    spec = _FULLTEXT_DISPATCH.get(id_type)
+    return spec[0](clean_id) if spec else False
+
+
 def cmd_fulltext(args):
-    """Dispatch full-text fetch by ID type:
+    """Dispatch full-text fetch by ID type via ``_FULLTEXT_DISPATCH``.
 
-    - arxiv → existing tex source download (LaTeX, with PDF/text fallback)
-    - pmcid → PMC fallback chain (JATS XML → BioC JSON → PDF + text)
-    - pmid  → PMC chain; fallback to OA-mirror lookup when no PMC copy
-    - doi (ChemRxiv 10.26434/*) → OA mirror → Cloudflared direct → headless browser
-    - doi (bioRxiv/medRxiv 10.1101/*) → Europe PMC PMC → OA mirror → headless browser
-
-    ``--from-file PATH`` is a universal escape hatch: if every automatic
-    path gets blocked (IP reputation / JS challenge / paywall), download
-    the PDF manually via a real browser and pass its path here. We'll
-    save + extract text like any other successful download.
+    ``--from-file PATH`` bypasses all network paths: point it at a manually
+    downloaded PDF and we extract text + save to cache with the ID's
+    canonical basename. Agents with Playwright MCP should use this after
+    fetching content the automatic chain couldn't reach.
     """
     id_type, clean_id = extract_paper_id(args.arxiv_id)
 
@@ -1247,112 +1267,19 @@ def cmd_fulltext(args):
         _ingest_local_pdf(args.from_file, basename_for_id(id_type, clean_id))
         return
 
-    if id_type == "arxiv":
-        cmd_tex(argparse.Namespace(arxiv_id=clean_id))
-        return
-
-    if id_type == "pmcid":
-        _fetch_pmc_to_disk(clean_id)
-        return
-
-    if id_type == "pmid":
-        # First try the PMC chain — structured XML / BioC / PDF from NCBI.
-        paper = get_paper_info_pubmed(clean_id)
-        pmcid = paper.pmcid if paper and paper.pmcid else pmid_to_pmcid(clean_id)
-        if pmcid:
-            _fetch_pmc_to_disk(pmcid)
-            return
-
-        # No PMC copy → walk preprint reverse lookup → OA mirror → shadow.
-        doi_for_pmid = paper.doi if paper else None
-        basename = f"PMID{clean_id}"
-        if doi_for_pmid:
-            print(
-                f"PMID:{clean_id} has no PMC copy — walking DOI fallback chain...",
-                file=sys.stderr,
-            )
-            layers = [
-                Layer(
-                    f"[1/3] Looking for preprint versions of {doi_for_pmid}...",
-                    lambda: _try_preprint_layer(doi_for_pmid, basename),
-                ),
-                Layer(
-                    f"[2/3] Trying OA mirrors for {doi_for_pmid}...",
-                    lambda: _try_oa_mirror_for_pdf(doi=doi_for_pmid),
-                ),
-                Layer(
-                    f"[3/3] Trying shadow libraries for {doi_for_pmid}...",
-                    lambda: try_shadow_libraries(doi_for_pmid),
-                ),
-            ]
-            if walk_layers(layers, basename=basename, output_dir=OUTPUT_DIR):
-                return
-
-        _fail_fulltext(
-            f"No full-text found for PMID:{clean_id} "
-            f"(no PMC copy, no preprint, no OA mirror, no shadow library)."
+    spec = _FULLTEXT_DISPATCH.get(id_type)
+    if spec is None:
+        print(
+            f"Unrecognised or unsupported identifier '{args.arxiv_id}' — "
+            f"`fulltext` supports arXiv ID, PMID, PMC ID, DOI (any), "
+            f"bioRxiv/medRxiv DOI.",
+            file=sys.stderr,
         )
+        sys.exit(1)
 
-    if id_type == "doi" and is_chemrxiv_doi(clean_id):
-        _fetch_chemrxiv_to_disk(clean_id)
-        return
-
-    if id_type == "doi" and _is_biorxiv_doi(clean_id):
-        _fetch_biorxiv_to_disk(clean_id)
-        return
-
-    if id_type == "doi":
-        # Generic journal DOI (Nature, Cell, Science, JACS, Angew, …) —
-        # no source-native chain. Walk preprint reverse lookup → OA mirror.
-        _fetch_generic_doi_to_disk(clean_id)
-        return
-
-    print(
-        f"Unrecognised or unsupported identifier '{args.arxiv_id}' — `fulltext` "
-        f"supports arXiv ID, PMID, PMC ID, DOI (any), bioRxiv/medRxiv DOI.",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-
-def _try_fulltext_for_id(id_type: str, clean_id: str) -> bool:
-    """Unified ID-type → fulltext dispatch returning bool.
-
-    Mirrors the cmd_fulltext routing tree but never calls ``sys.exit``;
-    used by the batch driver to walk a list of IDs without aborting on
-    any one failure. Each branch delegates to its ``_try_*_to_disk``
-    layered chain (which already returns bool).
-    """
-    if id_type == "arxiv":
-        return _try_arxiv_to_disk(clean_id)
-    if id_type == "pmcid":
-        return _try_pmc_to_disk(clean_id)
-    if id_type == "pmid":
-        # PMC chain first (structured), DOI fallback chain second.
-        paper = get_paper_info_pubmed(clean_id)
-        pmcid = paper.pmcid if paper and paper.pmcid else pmid_to_pmcid(clean_id)
-        if pmcid and _try_pmc_to_disk(pmcid):
-            return True
-        doi = paper.doi if paper else None
-        if not doi:
-            return False
-        basename = basename_for_id("pmid", clean_id)
-        layers = [
-            Layer(f"  preprint reverse lookup for {doi}",
-                  lambda: _try_preprint_layer(doi, basename)),
-            Layer(f"  OA mirrors for {doi}",
-                  lambda: _try_oa_mirror_for_pdf(doi=doi)),
-            Layer(f"  shadow libraries for {doi}",
-                  lambda: try_shadow_libraries(doi)),
-        ]
-        return walk_layers(layers, basename=basename, output_dir=OUTPUT_DIR)
-    if id_type == "doi":
-        if is_chemrxiv_doi(clean_id):
-            return _try_chemrxiv_to_disk(clean_id)
-        if _is_biorxiv_doi(clean_id):
-            return _try_biorxiv_to_disk(clean_id)
-        return _try_generic_doi_to_disk(clean_id)
-    return False
+    try_fn, fail_hint = spec
+    if not try_fn(clean_id):
+        _fail_fulltext(fail_hint(clean_id))
 
 
 def cmd_fulltext_batch(args):

@@ -161,41 +161,39 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fulltext <PMC ID>    # Direct Europ
 
 Dispatches by ID type with a layered fallback strategy:
 
-- **arXiv** → LaTeX source from arxiv.org/e-print + PDF text-extraction fallback
-- **PMC ID** → JATS XML (Europe PMC) → BioC JSON (NCBI) → PDF+text (PyMuPDF)
-- **PMID** → PMC chain if available; when no PMC copy, tries **OA mirror discovery** (Unpaywall + OpenAlex `best_oa_location` + Crossref TDM links) for publisher OA / institutional repo copies
-- **ChemRxiv DOI** (`10.26434/*`) → OA mirrors → direct ChemRxiv PDF → **headless browser via Playwright** (click-path then direct with warmup cookie); Cloudflare often wins, so final fallback is printing the URL
-- **bioRxiv / medRxiv DOI** (`10.1101/*`) → Europe PMC preprint full-text → OA mirrors → Playwright browser
+- arXiv → LaTeX source from arxiv.org/e-print + PDF text-extraction fallback
+- PMC ID → JATS XML (Europe PMC) → BioC JSON (NCBI) → PDF+text (PyMuPDF)
+- PMID → PMC chain if available; when no PMC copy, preprint reverse lookup → OA mirror discovery (Unpaywall + OpenAlex `best_oa_location` + CORE + Crossref TDM links)
+- ChemRxiv DOI (`10.26434/*`) → OA mirrors → direct ChemRxiv PDF
+- bioRxiv / medRxiv DOI (`10.1101/*`) → Europe PMC preprint full-text → OA mirrors
+- Generic journal DOI → Europe PMC PMC copy → preprint reverse lookup → OA mirror
+
+#### Cloudflare / paywall fallback: agent takes over via Playwright MCP
+
+When every automatic path fails, the tool prints a structured handoff:
+
+```
+All automatic full-text paths failed for 10.26434/chemrxiv-2024-abc.
+Landing URL: https://chemrxiv.org/doi/full/10.26434/chemrxiv-2024-abc
+If you are an agent with Playwright MCP available, fetch the PDF from the
+landing URL above ... then re-run `fulltext <id> --from-file <path>` to ingest it.
+```
+
+When you see this message: use your Playwright MCP to navigate to the
+landing URL, click through any Cloudflare challenge or publisher paywall,
+download the PDF to a local path, then re-run the same `fulltext` command
+with `--from-file <downloaded-path>`. The tool will extract text and cache
+the result exactly as if the automatic path had succeeded.
 
 #### Manual escape hatch: `--from-file PATH`
 
-When every automatic path fails (IP reputation, Cloudflare, paywall),
-download the PDF yourself via a real browser and feed it in:
+Same flag, used directly when you already have a PDF on disk:
 
 ```bash
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fulltext <ID> --from-file ~/Downloads/paper.pdf
 ```
 
-Runs the normal PyMuPDF text extraction + cache save, with the ID's canonical
-filename, so the `.txt` output plugs into the same reading workflow as any
-automatic download.
-
-#### Installing the headless browser (optional)
-
-For Cloudflare-protected sources (ChemRxiv, bioRxiv, medRxiv), install
-Playwright + Chromium once:
-
-```bash
-pip install playwright
-playwright install chromium
-
-# or ephemeral via uv:
-uv run --with playwright python -m playwright install chromium
-```
-
-Without Playwright the tool still works — OA-mirror paths cover ~60-80%
-of ChemRxiv papers (published versions / institutional repos / arXiv
-cross-posts), and `--from-file` covers the rest.
+PyMuPDF text extraction + cache save with the ID's canonical filename.
 
 ### bib — generate BibTeX citation
 
