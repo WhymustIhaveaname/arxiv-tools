@@ -14,227 +14,277 @@ description: >
   user is clearly doing literature work.
 ---
 
-# Academic Literature Tool (cross-domain)
+# Academic literature workflow
 
-Search, fetch metadata, generate citations, download full text, and look up citations across multiple scholarly databases: Semantic Scholar, OpenAlex, arXiv (and — under active development — PubMed, PubMed Central, bioRxiv, medRxiv, ChemRxiv, Europe PMC, Crossref).
+<goal>
+When the user asks for a paper's full text, your job is to land the text onto
+disk at the canonical cache path, in the most LLM-readable format available.
+Finish when the bytes are saved, not when the first automatic path fails. The
+automatic pipeline already walks a layered fallback (OA mirrors, PMC cross-
+references, preprint reverse-lookup) and will hand off paywalled /
+Cloudflare-protected cases to you with a Playwright MCP recipe; complete the
+handoff yourself rather than reporting failure back to the user.
+</goal>
 
-Five subcommands: `search`, `info`, `tex`, `bib`, `cited`.
+## How to invoke
 
-## How to run
-
-Script dependencies are declared in inline metadata at the top of the file — you are responsible for installing them yourself.
-
-## Subcommands
-
-### search — find papers
-
-```bash
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "keywords"
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "keywords" --max 10
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" search "keywords" --source s2|openalex|arxiv|pubmed
-```
-
-Works across all fields — S2 and OpenAlex cover chemistry, biology, medicine, physics, etc. For dedicated biomedical search (MeSH terms, clinical results), use `--source pubmed`.
-
-PubMed-specific filters (work with `--source pubmed`):
+Every subcommand runs via:
 
 ```bash
---year 2020              # single year
---year 2020-2024         # year range (open-ended "2020-" / "-2015" ok)
---offset 20              # skip first 20 results (pagination)
---open-access            # restrict to free-full-text subset
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" <subcommand> <args>
 ```
 
-MeSH and field tags pass through the query directly, e.g.
-`search 'CRISPR-Cas Systems[MeSH]' --source pubmed`.
+`uv` reads the PEP 723 inline metadata at the top of `arxiv_tool.py` and
+installs dependencies automatically. No manual setup is needed.
 
-Europe PMC-specific notes (`--source europepmc`):
+Any ID form works wherever a paper is referenced: arXiv ID (`2401.12345`),
+DOI (bare `10.xxxx/...` or `https://doi.org/...`), PMID (numeric),
+PMC ID (`PMC1234567`), bioRxiv / medRxiv / ChemRxiv URL. The tool
+autodetects.
 
-```bash
---year 2020 / 2020-2024
---offset 20
---open-access
-```
+## Commands — decision table
 
-Europe PMC's query DSL passes through, so you can write e.g.
-`search 'SRC:PPR AND CRISPR' --source europepmc` to restrict to preprints,
-or `TITLE:"foo" AND AUTH:"Smith"` for field-tagged searches. Covers
-PubMed + PMC + preprints (bioRxiv/medRxiv/Research Square) + patents in one
-API.
+| The user wants... | Run |
+|---|---|
+| Search papers (default: all sources parallel, dedup) | `search "<query>"` |
+| Paper metadata (abstract, authors, IDs, year) | `info <id>` |
+| BibTeX entry | `bib <id>` |
+| Who cited this paper | `cited <id>` |
+| What this paper cites | `references <id>` |
+| Biomedical similar papers | `similar <pmid>` |
+| Text-mined genes / diseases / chemicals in a paper | `annotations <id>` |
+| arXiv LaTeX source only | `tex <arxiv-id>` |
+| Paper full text onto disk (any ID type) | `fulltext <id>` |
+| Bulk fulltext over a list of IDs | `fulltext-batch <ids.txt>` |
+| Ingest PDFs you already have | `fulltext-import <dir>` |
 
-ChemRxiv-specific filters (`--source chemrxiv`):
+## Canonical cache layout
 
-```bash
---year 2024              # filter posting year (also accepts ranges)
---offset 20              # pagination
-```
+<cache>
+Output files land under `$ARXIV_CACHE_DIR` (default: a `.arxiv/` directory
+inside the plugin). Every successful `fulltext` run writes files named after
+the ID. Basename rules:
 
-ChemRxiv DOIs (`10.26434/chemrxiv-*`) are handled automatically for
-`info`/`bib`/`cited`/`references`. Search routes through Crossref because
-chemrxiv.org's native API is Cloudflare-blocked for non-browser clients.
+| ID type | Basename |
+|---|---|
+| arXiv  | `2401.12345` (slashes replaced with `_`, handles old format `cs_0401001`) |
+| PMID   | `PMID39876543` |
+| PMC ID | `PMC7610144` (uppercased) |
+| DOI    | `10.26434_chemrxiv-2024-abc` (lowercase, `/` → `_`) |
 
-S2-specific filter parameters:
+Files written by format, preference-sorted (best for LLM first):
 
-```bash
---year 2024                    # single year
---year 2020-2024               # year range
---fields-of-study "Computer Science,Physics,Biology,Chemistry,Medicine"
---pub-types "JournalArticle,Conference"
---min-citations 50
---venue "NeurIPS"
---open-access                  # open-access only
-```
+1. `<basename>.xml` — JATS XML with structured section / figure / table tags (PMC)
+2. `<basename>.bioc.json` — passage-level structured text (PMC fallback)
+3. `<id>_<title-slug>/` — directory of `.tex` source files (arXiv)
+4. `<basename>.pdf` + `<basename>.txt` — PDF with PyMuPDF text extraction
 
-S2 bulk search (up to 1000 results, supports sorting and pagination):
+After every `fulltext` call, read the highest-priority file that exists for
+that basename. When only `.txt` exists the paper is still fully readable;
+structured formats are preferred because they preserve section boundaries.
+</cache>
 
-```bash
---bulk --sort "citationCount:desc"
---bulk --token <token from previous page>   # pagination
-```
+## Full-text retrieval — the main workflow
 
-### info — get paper metadata (does not download tex)
+<algorithm>
+For every paper the user asks you to fetch, in order:
 
-```bash
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info <arXiv ID>
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info <PMID>             # PubMed
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info <PMC ID>           # e.g. PMC7610144 — auto-resolved to PMID via ELink
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info <DOI>              # e.g. 10.1038/s41586-020-2649-2 — resolved via OpenAlex
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info https://pubmed.ncbi.nlm.nih.gov/39876543/
-```
+1. Run `uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fulltext <id>`.
 
-ID type is auto-detected: arXiv ID / URL, PMID, PMC ID, DOI (bare or
-https://doi.org/...), or ncbi URLs.
+2. Inspect stderr + stdout. Three outcomes:
 
-### references — forward citation lookup (this paper's bibliography)
+   - Output contains `Saved JATS XML:` / `Saved BioC JSON:` / `Saved PDF:` /
+     `Saved text:` / `Directory structure:`. The file is on disk. Move on.
 
-Inverse of `cited`. Returns the papers that this paper cites.
+   - Output contains `Already exists:`. The cache already has this paper.
+     Move on.
 
-```bash
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" references <arXiv ID>
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" references <PMID>
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" references <PMC ID>
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" references <DOI>
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" references <ID> --max 50 --offset 20
-```
+   - Output starts with `All automatic full-text paths failed for <id>.`
+     and contains a `Landing URL:` line. Proceed to the Playwright MCP
+     recipe below.
 
-Order: S2 `/paper/{id}/references` first (rich metadata in one call); when
-S2 has no data for a PubMed paper, falls back to NCBI ELink
-`pubmed_pubmed_refs` + ESummary.
+3. Verify the canonical file landed. Read the expected path from the cache
+   layout section. If the file is missing after a "Saved ..." line, surface
+   that as a bug — do not silently ignore.
 
-### annotations — text-mined entities (Europe PMC)
+4. Read the file (prefer `.xml` > `.bioc.json` > `.tex` dir > `.txt`) and
+   continue with the user's task.
+</algorithm>
 
-Pull text-mined biomedical / chemical entities from Europe PMC's
-Annotations API — genes, diseases, chemicals, organisms, Gene Ontology
-terms, experimental methods, and dataset accession numbers, each with
-a canonical ontology URI (UniProt / UMLS / CHEBI / GO / etc.).
+## Playwright MCP recipe — run this when automatic fetch fails
 
-```bash
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" annotations <PMID>
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" annotations <PMC ID>
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" annotations <DOI>                    # must map to PubMed/PMC
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" annotations <ID> --type genes,diseases
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" annotations <ID> --max-per-type 10
-```
+<recipe>
+The tool has already tried open-access mirrors (Unpaywall / OpenAlex
+`best_oa_location` / CORE / Crossref TDM), Europe PMC cross-references,
+preprint reverse-lookup, and direct publisher fetch. Remaining failure modes
+are Cloudflare challenges, publisher paywalls, and JS-required download
+buttons. Playwright MCP bypasses all three.
 
-Supported `--type` values: `genes`, `diseases`, `chemicals`, `organisms`,
-`go`, `methods`, `accessions`, `resources`, `all` (default).
+Flow: navigate to the landing URL → find the PDF → save bytes to a temp path
+→ re-run `fulltext <id> --from-file <tmp-path>` so the tool ingests the PDF
+into the canonical cache with text extraction.
 
-Entities are deduplicated per type (same surface string + URI collapse to
-one line with a `[N×]` mention count). PMC full-text gives the richest
-annotations; PubMed-only records fall back to title+abstract mining.
+Concrete steps:
 
-### tex — download LaTeX source (arXiv only)
+1. `browser_navigate` to the `Landing URL:` from the failure message. Allow
+   60 s timeout; Cloudflare Turnstile (a JavaScript challenge that auto-solves
+   in the background) typically clears in 5–15 s.
 
-```bash
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" tex <arXiv ID>
-```
+2. `browser_snapshot` to see the loaded page. If the title contains
+   `Just a moment...` or `Verifying`, wait a few seconds and snapshot again
+   until the real article page appears.
 
-Downloads the tex source and returns the directory path and structure, preserving full LaTeX formatting and figures. If the source is unavailable, falls back to PDF download and text extraction.
+3. Find the PDF download control and fetch the bytes. The best path depends
+   on the site:
 
-### fulltext — download full text (any supported source)
+   - `<meta name="citation_pdf_url">` in the page head — most journals set
+     this. `browser_evaluate` to read `document.querySelector('meta[name=
+     "citation_pdf_url"]').content`, then fetch that URL with the browser's
+     cookies via another `browser_evaluate("async () => await (await
+     fetch(url)).arrayBuffer()")`.
 
-```bash
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fulltext <arXiv ID>  # LaTeX source + PDF fallback (same as `tex`)
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fulltext <PMID>      # ELink → PMC → JATS XML
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fulltext <PMC ID>    # Direct Europe PMC JATS XML
-```
+   - A visible download button or link. Snapshot, identify the ref, click
+     it, capture the resulting download via `browser_network_requests` or
+     a download event.
 
-Dispatches by ID type with a layered fallback strategy:
+   - Direct `.pdf` href (common on bioRxiv `/content/<doi>.full.pdf`, PMC
+     `/pdf/` endpoints).
 
-- arXiv → LaTeX source from arxiv.org/e-print + PDF text-extraction fallback
-- PMC ID → JATS XML (Europe PMC) → BioC JSON (NCBI) → PDF+text (PyMuPDF)
-- PMID → PMC chain if available; when no PMC copy, preprint reverse lookup → OA mirror discovery (Unpaywall + OpenAlex `best_oa_location` + CORE + Crossref TDM links)
-- ChemRxiv DOI (`10.26434/*`) → OA mirrors → direct ChemRxiv PDF
-- bioRxiv / medRxiv DOI (`10.1101/*`) → Europe PMC preprint full-text → OA mirrors
-- Generic journal DOI → Europe PMC PMC copy → preprint reverse lookup → OA mirror
+4. Write the bytes to a temp path (e.g. `/tmp/<basename>.pdf`). Confirm the
+   first four bytes are `%PDF` before re-invoking the tool — anything else
+   is an error page, a login wall, or a CF challenge that didn't clear.
 
-#### Cloudflare / paywall fallback: agent takes over via Playwright MCP
+5. Run:
 
-When every automatic path fails, the tool prints a structured handoff:
+   ```bash
+   uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fulltext <id> --from-file /tmp/<basename>.pdf
+   ```
 
-```
-All automatic full-text paths failed for 10.26434/chemrxiv-2024-abc.
-Landing URL: https://chemrxiv.org/doi/full/10.26434/chemrxiv-2024-abc
-If you are an agent with Playwright MCP available, fetch the PDF from the
-landing URL above ... then re-run `fulltext <id> --from-file <path>` to ingest it.
-```
+   The tool validates the magic bytes, extracts text with PyMuPDF, saves
+   `<basename>.pdf` + `<basename>.txt` to the canonical cache.
 
-When you see this message: use your Playwright MCP to navigate to the
-landing URL, click through any Cloudflare challenge or publisher paywall,
-download the PDF to a local path, then re-run the same `fulltext` command
-with `--from-file <downloaded-path>`. The tool will extract text and cache
-the result exactly as if the automatic path had succeeded.
+6. Read the resulting `.txt` and continue.
 
-#### Manual escape hatch: `--from-file PATH`
+Site-specific hints (domain knowledge you won't find in Playwright docs):
 
-Same flag, used directly when you already have a PDF on disk:
+- ChemRxiv: the article page is Cloudflare-challenged on first visit. A single
+  navigate + ~10 s wait clears the challenge. Known working download selectors,
+  in priority order: `a[download][href*="asset"]`, `a[href*="/original/"]`,
+  `button:has-text("Download")`. The asset URL is same-origin with the article
+  page; clicking from the cleared article page succeeds where a direct hit
+  from a fresh context fails.
+- bioRxiv / medRxiv: after you've visited `https://www.biorxiv.org/content/<doi>`
+  (or `www.medrxiv.org/...`) the session has the clearance cookie, and
+  `/content/<doi>.full.pdf` serves the PDF directly.
+- Nature / Cell / Springer / Wiley: the "Download PDF" button usually calls
+  a signed asset URL via JS. Click-then-capture works; direct hrefs often
+  don't.
+- Institutional paywalls (NEJM, Science full text, many Wiley journals):
+  a login wall will stop you. Do not claim success. Instead, surface back to
+  the user: the landing URL you tried, what the page showed (login wall
+  vs CF challenge vs 404), and any OA alternatives the page links to
+  (preprint, institutional repo, author homepage).
 
-```bash
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" fulltext <ID> --from-file ~/Downloads/paper.pdf
-```
+<example>
+Handoff for a ChemRxiv DOI:
 
-PyMuPDF text extraction + cache save with the ID's canonical filename.
+  $ uv run ".../arxiv_tool.py" fulltext 10.26434/chemrxiv-2024-abc
+  [1/2] Trying OA mirrors for 10.26434/chemrxiv-2024-abc...
+    OA mirror download failed (...): 403
+  [2/2] Trying direct ChemRxiv PDF (likely Cloudflared)...
+    ChemRxiv PDF fetch failed: Cloudflare challenge
+  All automatic full-text paths failed for 10.26434/chemrxiv-2024-abc.
+  Landing URL: https://chemrxiv.org/doi/full/10.26434/chemrxiv-2024-abc
+  If you are an agent with Playwright MCP ... re-run `fulltext ... --from-file <path>` ...
 
-### bib — generate BibTeX citation
+Agent actions:
+  1. browser_navigate("https://chemrxiv.org/engage/chemrxiv/article-details/abc", timeout=60000)
+  2. browser_snapshot — title is "Just a moment..."; wait 10 s
+  3. browser_snapshot — title is now the paper title; the page has a
+     "Download" button mapped to an asset URL
+  4. browser_click on the Download button; capture the downloaded bytes
+  5. Save bytes to /tmp/10.26434_chemrxiv-2024-abc.pdf; verify first 4 bytes are b"%PDF"
+  6. uv run ".../arxiv_tool.py" fulltext 10.26434/chemrxiv-2024-abc \
+        --from-file /tmp/10.26434_chemrxiv-2024-abc.pdf
+       → Saved PDF: /home/arxiv/10.26434_chemrxiv-2024-abc.pdf (2,145,823 bytes)
+       → Saved text: /home/arxiv/10.26434_chemrxiv-2024-abc.txt (48,221 chars)
+  7. Read /home/arxiv/10.26434_chemrxiv-2024-abc.txt — continue with user's task.
+</example>
 
-```bash
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <arXiv ID>
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <PMID>                  # PubMed
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <PMC ID>                # auto-resolved to PMID
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <DOI>                   # Crossref direct
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" bib <ID> -o refs.bib        # append to file
-```
+Do not open a browser when the automatic chain already succeeded. The recipe
+is only for the handoff case.
+</recipe>
 
-For PMIDs / DOIs the tool first asks Crossref via DOI content negotiation
-(authoritative `@article` with journal/volume/issue/pages); on failure or
-when a PubMed paper has no DOI, it builds a minimal `@article` from EFetch
-metadata. Rendered BibTeX is cached per-ID so repeat calls are local.
+## Piggyback metadata while the browser is open
 
-### cited — reverse citation lookup
+<piggyback>
+The automatic metadata pipeline (OpenAlex / S2 / PubMed / Crossref) covers
+title, authors, abstract, year, DOI / PMID, citation counts, OA status. It
+does not always have:
 
-Find which papers cite a given paper.
+- author affiliations (institution per author)
+- funding / grant IDs
+- figure and table captions
+- supplementary material URLs
+- preprint-to-version-of-record link
+- keywords beyond what the API exposed
 
-```bash
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID>
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <PMID>               # PubMed
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <PMC ID>             # auto-resolved to PMID
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <DOI>                # via S2 DOI: accessor
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <ID> --max 50
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <ID> --offset 20     # pagination
-uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <ID> --source s2|openalex
-```
+When the user's task benefits from any of these and you have a landing page
+open anyway for a Playwright download, grab them in the same session.
+Do not open a browser solely for metadata enrichment — `info <id>` is the
+right tool for that, and it hits the API aggregator.
+</piggyback>
 
-S2 and OpenAlex both accept any of ArXiv:, PMID:, DOI: paper specs, so all
-ID types work the same way.
+## Search filters — consolidated reference
 
-## Data source fallback
+| Flag | Applies to | Meaning |
+|---|---|---|
+| `--max N` | all | max results (default 20) |
+| `--source <name>` | all | `all` (default: parallel + dedup across all sources) or one of `s2`, `openalex`, `arxiv`, `pubmed`, `chemrxiv`, `europepmc`, `auto` |
+| `--domain <name>` | with `--source all` | `bio` / `med` / `chem` / `cs` / `phys` — restricts to relevant sources and sets S2 fields-of-study |
+| `--snippet` | with `--source all` | S2 snippet search (rank by full-text phrase match — good for technical terms) |
+| `--year 2020` / `--year 2020-2024` | most | single year or range |
+| `--offset N` | PubMed, Europe PMC | pagination skip |
+| `--open-access` | S2, PubMed, Europe PMC | OA subset only |
+| `--fields-of-study A,B` | S2 | e.g. `Computer Science,Physics` |
+| `--pub-types A,B` | S2 | e.g. `JournalArticle,Conference` |
+| `--min-citations N` | S2 | citation floor |
+| `--venue NAME` | S2 | specific conference/journal |
+| `--bulk` | S2 | up to 1000 results with pagination |
+| `--sort field:dir` | S2 bulk | e.g. `citationCount:desc` |
+| `--token <t>` | S2 bulk | pagination continuation |
 
-| Subcommand | Fallback order |
-|------------|---------------|
-| search | S2 → OpenAlex → arXiv |
-| cited | S2 → OpenAlex |
-| info / bib | local cache → OpenAlex → S2 → arXiv |
-| tex | local cache → arXiv |
+Source-native query DSL passes through verbatim:
+- `--source pubmed` accepts MeSH and field tags: `'CRISPR-Cas Systems[MeSH]'`,
+  `'Smith J[Author]'`.
+- `--source europepmc` accepts the Europe PMC DSL: `'SRC:PPR AND CRISPR'`
+  (PPR = preprint sources), `'TITLE:"foo" AND AUTH:"Smith"'`.
 
-- search/cited prefer S2: more complete citation data
-- info/bib prefer OpenAlex: most lenient rate limit (0.1s/req vs S2 2s vs arXiv 5s)
+## Other flags
+
+| Command | Flag | Meaning |
+|---|---|---|
+| `info` / `bib` / `tex` | (ID only) | no extra flags |
+| `cited` | `--max`, `--offset`, `--source {auto,s2,openalex}` | pagination + source override |
+| `references` | `--max`, `--offset` | pagination (S2 + PubMed ELink fallback; no `--source`) |
+| `similar` | `--max`, `--offset` | pagination (NCBI ELink only) |
+| `annotations` | `--type` | comma-sep subset of `genes,diseases,chemicals,organisms,go,methods,accessions,resources,all` |
+| `annotations` | `--max-per-type N` | dedup cap per entity type (default 30) |
+| `fulltext` | `--from-file PATH` | ingest a manually-downloaded PDF, skip all network paths |
+| `fulltext-batch` | `--manifest PATH` | failure TSV output path |
+| `fulltext-import` | `--manifest PATH` | manifest from a prior `fulltext-batch` for filename-to-ID matching |
+
+## Data source fallback summary
+
+| Command | Order |
+|---|---|
+| `search` | `--source all` parallel aggregator (default); single-source with `--source <name>` |
+| `info` / `bib` | local cache → parallel aggregator → Crossref content negotiation (for bib) |
+| `cited` | S2 → OpenAlex |
+| `references` | S2 → PubMed ELink (biomed fallback) |
+| `tex` | arXiv e-print |
+| `fulltext` | per ID-type dispatch table (arxiv → LaTeX; PMC → JATS/BioC/PDF; PMID → PMC then DOI chain; DOI → OA mirrors → preprint reverse-lookup → Playwright handoff) |
+
+S2 leads search and citation lookup because of richer graph coverage;
+OpenAlex leads info/bib because of the most lenient rate limit
+(0.1 s/request). PubMed is the authoritative biomedical source.

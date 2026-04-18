@@ -1191,10 +1191,16 @@ def _try_doi_to_disk(doi: str) -> bool:
 
 
 def _doi_landing_url(doi: str) -> str:
+    """Return the user-facing article page URL for a DOI, suitable for an
+    agent with Playwright MCP to navigate (not the direct PDF asset URL,
+    which is typically Cloudflare-blocked without a session cookie from the
+    article page first).
+    """
     if is_chemrxiv_doi(doi):
-        return chemrxiv_pdf_url(doi) or f"https://chemrxiv.org/doi/full/{doi}"
+        return f"https://chemrxiv.org/doi/full/{doi}"
     if _is_biorxiv_doi(doi):
-        return _biorxiv_site_and_landing(doi)[1]
+        site, _ = _biorxiv_site_and_landing(doi)
+        return f"https://www.{site}.org/content/{doi}"
     return f"https://doi.org/{doi}"
 
 
