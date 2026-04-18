@@ -964,7 +964,7 @@ def _try_chemrxiv_to_disk(doi: str) -> bool:
     landing page is typically Cloudflare-protected; the caller prints a
     handoff message so an agent with Playwright MCP can take over.
     """
-    safe = doi.lower().replace("/", "_")
+    safe = basename_for_id("doi", doi)
     if _already_saved(safe, "pdf", "txt"):
         return True
 
@@ -1006,7 +1006,7 @@ def _try_biorxiv_to_disk(doi: str) -> bool:
     a scraped PDF. When both layers fail the caller prints a handoff so
     an agent with Playwright MCP can take over.
     """
-    safe = doi.lower().replace("/", "_")
+    safe = basename_for_id("doi", doi)
     if _already_saved(safe, "pdf", "txt"):
         return True
 
@@ -1141,7 +1141,7 @@ def _try_generic_doi_to_disk(doi: str) -> bool:
     when every layer fails; a calling agent with Playwright MCP can use
     the printed landing URL to fetch paywalled content and re-ingest.
     """
-    safe = doi.lower().replace("/", "_")
+    safe = basename_for_id("doi", doi)
     if _already_saved(safe, "pdf", "txt"):
         return True
 
@@ -1159,7 +1159,9 @@ def _try_generic_doi_to_disk(doi: str) -> bool:
 def _try_pmid_to_disk(pmid: str) -> bool:
     """PMID fallback chain: PMC copy → preprint reverse lookup → OA mirror."""
     paper = get_paper_info_pubmed(pmid)
-    pmcid = paper.pmcid if paper and paper.pmcid else pmid_to_pmcid(pmid)
+    # Trust EFetch's ArticleIdList when it returned a record; only ELink-fall
+    # back when EFetch itself failed (paper is None).
+    pmcid = paper.pmcid if paper else pmid_to_pmcid(pmid)
     if pmcid and _try_pmc_to_disk(pmcid):
         return True
     doi = paper.doi if paper else None
@@ -1196,10 +1198,9 @@ def _doi_landing_url(doi: str) -> str:
     return f"https://doi.org/{doi}"
 
 
-def _agent_handoff_hint(clean_id: str, id_type: str, landing: str) -> str:
+def _agent_handoff_hint(clean_id: str, landing: str) -> str:
     """Structured failure message inviting an agent with Playwright MCP to retake.
 
-    Printed verbatim to stderr when the automatic chain exhausts itself.
     Parseable by a calling Claude: `Landing URL:` and `--from-file` are the
     two affordances the agent needs to fetch the PDF with Playwright MCP
     and re-ingest it via this tool.
@@ -1242,7 +1243,7 @@ _FULLTEXT_DISPATCH = {
     ),
     "doi": (
         _try_doi_to_disk,
-        lambda cid: _agent_handoff_hint(cid, "doi", _doi_landing_url(cid)),
+        lambda cid: _agent_handoff_hint(cid, _doi_landing_url(cid)),
     ),
 }
 
