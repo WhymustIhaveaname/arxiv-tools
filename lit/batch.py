@@ -36,8 +36,26 @@ MANIFEST_COLUMNS = ("id", "id_type", "basename", "url_to_try", "reason")
 
 
 def _publisher_url(id_type: str, clean_id: str) -> str:
-    """Best-guess landing URL for manual download."""
+    """Best-guess landing URL for manual download.
+
+    DOI lands default at ``doi.org``; ChemRxiv / bioRxiv / medRxiv are
+    special-cased to the publisher's article page because the generic
+    ``doi.org`` redirect bounces through Cloudflare-protected asset URLs
+    that typically fail from the same IPs the batch chain already failed
+    on. Sending the user (or downstream Playwright-MCP agent) directly at
+    the article page lets them see the publisher's own manual-download
+    link without an extra redirect.
+    """
     if id_type == "doi":
+        low = clean_id.lower()
+        if low.startswith("10.26434/"):
+            return f"https://chemrxiv.org/doi/full/{clean_id}"
+        if low.startswith("10.1101/"):
+            # bioRxiv + medRxiv share the 10.1101 prefix. doi.org does the
+            # right routing, but pointing at www.biorxiv.org/content/ gets
+            # you a clickable PDF button one step earlier. medRxiv papers
+            # redirect transparently from biorxiv if queried there.
+            return f"https://www.biorxiv.org/content/{clean_id}"
         return f"https://doi.org/{clean_id}"
     if id_type == "arxiv":
         return f"https://arxiv.org/abs/{clean_id}"

@@ -27,6 +27,21 @@ class TestPublisherUrl:
     def test_doi(self):
         assert _publisher_url("doi", "10.1038/foo") == "https://doi.org/10.1038/foo"
 
+    def test_chemrxiv_doi_uses_article_page(self):
+        """ChemRxiv DOIs point at chemrxiv.org/doi/full/ so the user (or a
+        Playwright-MCP agent) lands on the article page instead of
+        bouncing through the Cloudflare-blocked asset URL."""
+        assert (
+            _publisher_url("doi", "10.26434/chemrxiv-2024-zmmnw")
+            == "https://chemrxiv.org/doi/full/10.26434/chemrxiv-2024-zmmnw"
+        )
+
+    def test_biorxiv_doi_uses_content_url(self):
+        assert (
+            _publisher_url("doi", "10.1101/2023.01.01.523456")
+            == "https://www.biorxiv.org/content/10.1101/2023.01.01.523456"
+        )
+
     def test_arxiv(self):
         assert _publisher_url("arxiv", "2401.12345") == "https://arxiv.org/abs/2401.12345"
 

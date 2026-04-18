@@ -1901,6 +1901,55 @@ class TestPrintCitationsS2:
         out = capsys.readouterr().out
         assert "[5]" in out
 
+    def test_stub_entries_filtered(self, capsys):
+        """S2 /references sometimes returns JATS body fragments as stub
+        rows (no authors, no year, no IDs, citationCount=None). The output
+        hides them and re-numbers the remaining real entries."""
+        results = [
+            {
+                "title": "Real Paper",
+                "authors": [{"name": "Alice"}], "externalIds": {"DOI": "10.1/x"},
+                "citationCount": 10, "year": 2024,
+            },
+            {
+                "title": "Filter Efficacy : a sentence from the body text",
+                "authors": [], "externalIds": {}, "citationCount": None, "year": None,
+            },
+            {
+                "title": "Another Real Paper",
+                "authors": [{"name": "Bob"}], "externalIds": {}, "citationCount": 0,
+                "year": 2023,
+            },
+        ]
+        arxiv_tool._print_citations_s2(results)
+        captured = capsys.readouterr()
+        assert "Real Paper" in captured.out
+        assert "Another Real Paper" in captured.out
+        assert "Filter Efficacy" not in captured.out
+        # Survivors keep contiguous numbering.
+        assert "[1] Real Paper" in captured.out
+        assert "[2] Another Real Paper" in captured.out
+        # Filter summary lands on stderr so it doesn't pollute piped output.
+        assert "1 stub entries filtered" in captured.err
+
+    def test_stub_detector_skips_papers_with_any_signal(self, capsys):
+        """A paper with *any* of authors/year/IDs/citationCount is kept."""
+        results = [
+            {"title": "has year only", "authors": [], "externalIds": {},
+             "citationCount": None, "year": 2020},
+            {"title": "has authors only", "authors": [{"name": "X"}],
+             "externalIds": {}, "citationCount": None, "year": None},
+            {"title": "has ext ids only", "authors": [],
+             "externalIds": {"DOI": "10.1/y"}, "citationCount": None, "year": None},
+            {"title": "has zero cites (not None)", "authors": [], "externalIds": {},
+             "citationCount": 0, "year": None},
+        ]
+        arxiv_tool._print_citations_s2(results)
+        out = capsys.readouterr().out
+        for t in ("has year only", "has authors only",
+                  "has ext ids only", "has zero cites"):
+            assert t in out
+
 
 class TestPrintCitationsOpenAlex:
     """_print_citations_openalex 输出格式"""

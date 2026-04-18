@@ -338,8 +338,31 @@ def _normalize_s2_search(results: list[dict]) -> list[dict]:
     return out
 
 
+def _is_stub_citation(paper: dict) -> bool:
+    """Heuristic: S2's ``/references`` occasionally returns partial records
+    matched from JATS body fragments — bullet text or figure captions that
+    the upstream parser mistook for reference entries. They come through
+    with no authors, no year, no external IDs, AND ``citationCount=None``
+    (S2 fills the count when the candidate matched a real paper; ``None``
+    signals an unresolved stub). Any legitimate S2 paper record will
+    populate at least one of these four slots.
+    """
+    if paper.get("authors"):
+        return False
+    if paper.get("year"):
+        return False
+    if paper.get("externalIds") or {}:
+        return False
+    return paper.get("citationCount") is None
+
+
 def _print_citations_s2(results: list[dict], start: int = 1) -> None:
-    for i, paper in enumerate(results, start):
+    idx = start
+    filtered = 0
+    for paper in results:
+        if _is_stub_citation(paper):
+            filtered += 1
+            continue
         ext_ids = paper["externalIds"] or {}
         arxiv_ext = ext_ids.get("ArXiv")
         arxiv_str = f"  arXiv:{arxiv_ext}" if arxiv_ext else ""
@@ -347,9 +370,17 @@ def _print_citations_s2(results: list[dict], start: int = 1) -> None:
         authors = paper["authors"] or []
         author_str = _truncate_authors([a["name"] for a in authors])
 
-        print(f"[{i}] {paper['title']}")
+        print(f"[{idx}] {paper['title']}")
         print(f"    Authors: {author_str}")
         print(
             f"    Year: {paper['year'] or '?'}  Cited: {paper['citationCount']}{arxiv_str}"
         )
         print()
+        idx += 1
+
+    if filtered:
+        print(
+            f"({filtered} stub entries filtered — "
+            f"upstream JATS body fragments miscategorised as references)",
+            file=sys.stderr,
+        )

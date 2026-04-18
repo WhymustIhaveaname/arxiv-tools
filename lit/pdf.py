@@ -24,10 +24,14 @@ _DOI_RE = re.compile(r"\b10\.\d{4,9}/[^\s\"'<>]+", re.IGNORECASE)
 
 def _normalize_doi(raw: str) -> str:
     """Strip surrounding noise from a candidate DOI string."""
-    raw = raw.strip().rstrip(".,;)]}>")
-    # Strip a trailing citation marker like "doi:10.xxx/foo." that occasionally
-    # hangs off URL-encoded DOIs in PDF metadata.
-    return raw.lower()
+    raw = raw.strip().rstrip(".,;)]}>").lower()
+    # ChemRxiv mints one DOI per version suffix (…-v2, …-v3). The unversioned
+    # base resolves to the latest version on Crossref and is what batch IDs
+    # and searches normally refer to — collapse the PDF-embedded versioned
+    # form so both IDs land on the same cache basename.
+    if raw.startswith("10.26434/"):
+        raw = re.sub(r"-v\d+$", "", raw)
+    return raw
 
 
 def extract_doi_from_pdf(pdf_bytes: bytes) -> str | None:
@@ -118,9 +122,23 @@ def save_pdf_and_text(
     print(f"Saved PDF: {pdf_path} ({len(pdf_bytes):,} bytes)")
 
     text = extract_pdf_text(pdf_bytes)
-    if not text:
+    if text is None:
         print("PDF text extraction failed; raw PDF is still usable.", file=sys.stderr)
         return
+
+    # Image-only PDFs (e.g. "Microsoft: Print To PDF" or scanned old reviews)
+    # produce a multi-MB binary with no text layer; PyMuPDF returns a page
+    # count's worth of empty strings, which join into all-whitespace output.
+    # Flag the case so the user knows to re-source, but still write the
+    # (near-empty) .txt so the cache has a known-complete entry.
+    if len(pdf_bytes) > 100_000 and len(text.strip()) < 500:
+        print(
+            f"Warning: {out_basename} looks scanned/image-only "
+            f"({len(pdf_bytes):,}B PDF → only {len(text.strip())} text chars). "
+            f"Downstream LLM consumers will not see the content. Consider "
+            f"re-downloading from a source with an embedded text layer.",
+            file=sys.stderr,
+        )
 
     header = f"# {out_basename}\n"
     if source_url:
