@@ -27,6 +27,7 @@ never aborts the run.
 from __future__ import annotations
 
 import csv
+import re
 import sys
 from pathlib import Path
 from typing import Callable
@@ -34,6 +35,29 @@ from typing import Callable
 from lit.config import SCP_HOST, SCP_SOURCE
 from lit.ids import basename_for_id, extract_paper_id
 from lit.pdf import extract_doi_from_pdf, ingest_local_pdf, is_pdf_bytes
+
+
+# ChemRxiv (and a few other preprint servers) issue versioned DOIs of the
+# form ``10.x/preprint-id/v2``. After ``basename_for_id`` collapses ``/``
+# to ``_`` that becomes ``..._v2``. The bare form is the same underlying
+# preprint, so a queue listing the bare form is satisfied by ingesting any
+# version. Match anchored at end so we don't strip incidental ``_v\d`` that
+# happens to be part of a real ID body.
+_VERSION_SUFFIX_RE = re.compile(r"_v\d+$")
+
+
+def _basename_aliases(basename: str) -> set[str]:
+    """All basenames that should be considered the same paper.
+
+    Today this means: a versioned ChemRxiv basename also matches its bare
+    form. Returns the input unchanged when no alias rule applies, so
+    callers can use ``in aliases`` without special-casing.
+    """
+    aliases = {basename}
+    stripped = _VERSION_SUFFIX_RE.sub("", basename)
+    if stripped != basename:
+        aliases.add(stripped)
+    return aliases
 
 
 # TSV columns the manifest uses. ``url_to_try`` is what the user opens in a
@@ -257,10 +281,12 @@ def record_single_success(
     if not rows:
         return
     id_type, clean_id = extract_paper_id(raw_id)
-    canonical = basename_for_id(id_type, clean_id) if id_type != "unknown" else None
+    aliases: set[str] = set()
+    if id_type != "unknown":
+        aliases = _basename_aliases(basename_for_id(id_type, clean_id))
     remaining = [
         r for r in rows
-        if r.get("id") != raw_id and (canonical is None or r.get("basename") != canonical)
+        if r.get("id") != raw_id and r.get("basename") not in aliases
     ]
     if len(remaining) == len(rows):
         return  # not listed, nothing to do
@@ -401,13 +427,13 @@ def run_import(
             )
             _remove_quietly(pdf)
             skipped += 1
-            ingested_basenames.add(basename)  # already-cached counts as resolved
+            ingested_basenames.update(_basename_aliases(basename))  # already-cached counts as resolved
             continue
         print(f"  → ingesting {pdf.name} as {basename}", file=sys.stderr)
         ingest_local_pdf(str(pdf), basename, output_dir)
         _remove_quietly(pdf)  # cached copy in output_dir is canonical
         imported += 1
-        ingested_basenames.add(basename)
+        ingested_basenames.update(_basename_aliases(basename))
 
     if manifest_path and manifest and ingested_basenames:
         remaining = [r for r in manifest if r.get("basename") not in ingested_basenames]

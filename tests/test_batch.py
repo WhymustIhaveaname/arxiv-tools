@@ -10,6 +10,7 @@ import pytest
 
 from lit.batch import (
     MANIFEST_COLUMNS,
+    _basename_aliases,
     _publisher_url,
     _read_id_lines,
     _reverse_basename_to_id,
@@ -621,3 +622,67 @@ class TestRecordSingleSuccess:
         )
         assert not manifest.exists()
         assert not download_me.exists()
+
+
+class TestBasenameAliases:
+    """ChemRxiv versioned DOIs (``/v2``) collapse to ``_v2`` after basename
+    normalisation; the bare form is the same paper. Both ingest-time pruning
+    and record_single_success rely on this aliasing."""
+
+    def test_bare_basename_has_only_itself(self):
+        assert _basename_aliases("10.1038_x") == {"10.1038_x"}
+
+    def test_versioned_chemrxiv_aliases_to_bare(self):
+        assert _basename_aliases("10.26434_chemrxiv-2025-0g4wn_v2") == {
+            "10.26434_chemrxiv-2025-0g4wn_v2",
+            "10.26434_chemrxiv-2025-0g4wn",
+        }
+
+    def test_only_strips_anchored_at_end(self):
+        """``_v2`` mid-string must not be touched — that's a real ID body."""
+        assert _basename_aliases("10.1234_abc_v2_def") == {"10.1234_abc_v2_def"}
+
+
+class TestVersionedDoiRoundtrip:
+    """End-to-end: a manifest with the bare ChemRxiv DOI is cleared by an
+    ingest of the v2 PDF (the canonical case from the stereo topic run)."""
+
+    def test_import_prunes_versioned_ingest(self, tmp_path):
+        pdf_dir = tmp_path / "downloads"
+        pdf_dir.mkdir()
+        out_dir = tmp_path / "out"
+        manifest = tmp_path / "m.tsv"
+        download_me = tmp_path / "download_me.txt"
+        drop = tmp_path / "drops"
+        _seed_manifest(manifest, [_doi_row("10.26434/chemrxiv-2025-0g4wn")])
+        _write_pdf(pdf_dir / "anything.pdf")
+
+        # PDF body advertises the versioned DOI.
+        with patch(
+            "lit.batch.extract_doi_from_pdf",
+            return_value="10.26434/chemrxiv-2025-0g4wn/v2",
+        ), patch("lit.batch.ingest_local_pdf"):
+            run_import(
+                pdf_dir, out_dir,
+                manifest_path=manifest,
+                download_me_path=download_me,
+                manual_pdf_dir=drop,
+            )
+
+        # Bare-form manifest entry got cleared by the v2 ingest.
+        assert not manifest.exists()
+        assert not download_me.exists()
+
+    def test_record_single_success_versioned_clears_bare(self, tmp_path):
+        manifest = tmp_path / "m.tsv"
+        download_me = tmp_path / "download_me.txt"
+        drop = tmp_path / "drops"
+        _seed_manifest(manifest, [_doi_row("10.26434/chemrxiv-2025-0g4wn")])
+
+        record_single_success(
+            "10.26434/chemrxiv-2025-0g4wn/v2",
+            manifest_path=manifest,
+            download_me_path=download_me,
+            manual_pdf_dir=drop,
+        )
+        assert not manifest.exists()
