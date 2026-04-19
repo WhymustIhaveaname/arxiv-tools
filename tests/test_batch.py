@@ -13,6 +13,8 @@ from lit.batch import (
     _publisher_url,
     _read_id_lines,
     _reverse_basename_to_id,
+    record_single_failure,
+    record_single_success,
     run_batch,
     run_import,
 )
@@ -379,6 +381,240 @@ class TestDownloadMeFile:
         run_batch(
             ids,
             try_fetch=lambda *_: True,
+            manifest_path=manifest,
+            download_me_path=download_me,
+            manual_pdf_dir=drop,
+        )
+        assert not manifest.exists()
+        assert not download_me.exists()
+
+
+# --------------------------------------------------------------------------
+# Failure-set sync: import prunes, single-paper failures append, single-paper
+# successes drop.  These three flows share `_sync_failures` so the manifest
+# and download_me.txt cannot drift.
+# --------------------------------------------------------------------------
+
+
+def _seed_manifest(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=MANIFEST_COLUMNS, delimiter="\t")
+        w.writeheader()
+        w.writerows(rows)
+
+
+def _doi_row(doi: str) -> dict:
+    base = doi.lower().replace("/", "_")
+    return {
+        "id": doi, "id_type": "doi", "basename": base,
+        "url_to_try": f"https://doi.org/{doi}",
+        "reason": "automatic chain exhausted",
+    }
+
+
+class TestImportPrunesManifest:
+    def test_partial_import_leaves_remaining_failures(self, tmp_path):
+        pdf_dir = tmp_path / "downloads"
+        pdf_dir.mkdir()
+        out_dir = tmp_path / "out"
+        manifest = tmp_path / "m.tsv"
+        download_me = tmp_path / "download_me.txt"
+        drop = tmp_path / "drops"
+        _seed_manifest(manifest, [_doi_row("10.1038/a"), _doi_row("10.1038/b")])
+        download_me.write_text("stale guide")
+        _write_pdf(pdf_dir / "10.1038_a.pdf")
+
+        with patch("lit.batch.extract_doi_from_pdf", return_value="10.1038/a"), \
+             patch("lit.batch.ingest_local_pdf"):
+            run_import(
+                pdf_dir, out_dir,
+                manifest_path=manifest,
+                download_me_path=download_me,
+                manual_pdf_dir=drop,
+            )
+
+        # One failure remains; manifest + download_me both rewritten.
+        with manifest.open() as f:
+            rows = list(csv.DictReader(f, delimiter="\t"))
+        assert [r["id"] for r in rows] == ["10.1038/b"]
+        text = download_me.read_text()
+        assert "10.1038/b" in text and "10.1038/a" not in text
+
+    def test_full_import_clears_both_files(self, tmp_path):
+        pdf_dir = tmp_path / "downloads"
+        pdf_dir.mkdir()
+        out_dir = tmp_path / "out"
+        manifest = tmp_path / "m.tsv"
+        download_me = tmp_path / "download_me.txt"
+        drop = tmp_path / "drops"
+        _seed_manifest(manifest, [_doi_row("10.1038/a")])
+        download_me.write_text("stale guide")
+        _write_pdf(pdf_dir / "10.1038_a.pdf")
+
+        with patch("lit.batch.extract_doi_from_pdf", return_value="10.1038/a"), \
+             patch("lit.batch.ingest_local_pdf"):
+            run_import(
+                pdf_dir, out_dir,
+                manifest_path=manifest,
+                download_me_path=download_me,
+                manual_pdf_dir=drop,
+            )
+
+        assert not manifest.exists()
+        assert not download_me.exists()
+
+    def test_already_cached_basename_still_prunes(self, tmp_path):
+        """If the user races and the basename is already in cache, we still
+        treat the manifest entry as resolved — the download is no longer
+        needed regardless of who wrote the bytes."""
+        pdf_dir = tmp_path / "downloads"
+        pdf_dir.mkdir()
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        manifest = tmp_path / "m.tsv"
+        download_me = tmp_path / "download_me.txt"
+        drop = tmp_path / "drops"
+        _seed_manifest(manifest, [_doi_row("10.1038/a")])
+        download_me.write_text("stale guide")
+        (out_dir / "10.1038_a.xml").write_text("<jats/>")
+        _write_pdf(pdf_dir / "10.1038_a.pdf")
+
+        with patch("lit.batch.extract_doi_from_pdf", return_value="10.1038/a"), \
+             patch("lit.batch.ingest_local_pdf"):
+            run_import(
+                pdf_dir, out_dir,
+                manifest_path=manifest,
+                download_me_path=download_me,
+                manual_pdf_dir=drop,
+            )
+
+        assert not manifest.exists()
+        assert not download_me.exists()
+
+    def test_no_manifest_path_keeps_legacy_behaviour(self, tmp_path):
+        """Callers that don't pass manifest_path still get the original
+        ingest-only behaviour with no surprise file writes."""
+        pdf_dir = tmp_path / "downloads"
+        pdf_dir.mkdir()
+        out_dir = tmp_path / "out"
+        _write_pdf(pdf_dir / "10.1038_a.pdf")
+
+        with patch("lit.batch.extract_doi_from_pdf", return_value="10.1038/a"), \
+             patch("lit.batch.ingest_local_pdf"):
+            imported, _ = run_import(pdf_dir, out_dir)
+        assert imported == 1
+        # No manifest implies no download_me side-effects to worry about.
+
+
+class TestRecordSingleFailure:
+    def test_appends_new_id(self, tmp_path):
+        manifest = tmp_path / "m.tsv"
+        download_me = tmp_path / "download_me.txt"
+        drop = tmp_path / "drops"
+
+        record_single_failure(
+            "10.1038/a",
+            manifest_path=manifest,
+            download_me_path=download_me,
+            manual_pdf_dir=drop,
+        )
+        with manifest.open() as f:
+            rows = list(csv.DictReader(f, delimiter="\t"))
+        assert [r["id"] for r in rows] == ["10.1038/a"]
+        assert "10.1038/a" in download_me.read_text()
+
+    def test_dedup_on_repeat(self, tmp_path):
+        """A retry that fails again must not double-list."""
+        manifest = tmp_path / "m.tsv"
+        download_me = tmp_path / "download_me.txt"
+        drop = tmp_path / "drops"
+        _seed_manifest(manifest, [_doi_row("10.1038/a")])
+
+        record_single_failure(
+            "10.1038/a",
+            manifest_path=manifest,
+            download_me_path=download_me,
+            manual_pdf_dir=drop,
+        )
+        with manifest.open() as f:
+            rows = list(csv.DictReader(f, delimiter="\t"))
+        assert len(rows) == 1
+
+    def test_appends_to_existing_manifest(self, tmp_path):
+        manifest = tmp_path / "m.tsv"
+        download_me = tmp_path / "download_me.txt"
+        drop = tmp_path / "drops"
+        _seed_manifest(manifest, [_doi_row("10.1038/a")])
+
+        record_single_failure(
+            "10.1038/b",
+            manifest_path=manifest,
+            download_me_path=download_me,
+            manual_pdf_dir=drop,
+        )
+        with manifest.open() as f:
+            rows = list(csv.DictReader(f, delimiter="\t"))
+        assert sorted(r["id"] for r in rows) == ["10.1038/a", "10.1038/b"]
+
+
+class TestRecordSingleSuccess:
+    def test_drops_listed_id(self, tmp_path):
+        manifest = tmp_path / "m.tsv"
+        download_me = tmp_path / "download_me.txt"
+        drop = tmp_path / "drops"
+        _seed_manifest(manifest, [_doi_row("10.1038/a"), _doi_row("10.1038/b")])
+        download_me.write_text("stale")
+
+        record_single_success(
+            "10.1038/a",
+            manifest_path=manifest,
+            download_me_path=download_me,
+            manual_pdf_dir=drop,
+        )
+        with manifest.open() as f:
+            rows = list(csv.DictReader(f, delimiter="\t"))
+        assert [r["id"] for r in rows] == ["10.1038/b"]
+
+    def test_clears_files_when_last_entry_removed(self, tmp_path):
+        manifest = tmp_path / "m.tsv"
+        download_me = tmp_path / "download_me.txt"
+        drop = tmp_path / "drops"
+        _seed_manifest(manifest, [_doi_row("10.1038/a")])
+        download_me.write_text("stale")
+
+        record_single_success(
+            "10.1038/a",
+            manifest_path=manifest,
+            download_me_path=download_me,
+            manual_pdf_dir=drop,
+        )
+        assert not manifest.exists()
+        assert not download_me.exists()
+
+    def test_no_op_when_id_not_listed(self, tmp_path):
+        manifest = tmp_path / "m.tsv"
+        download_me = tmp_path / "download_me.txt"
+        drop = tmp_path / "drops"
+        _seed_manifest(manifest, [_doi_row("10.1038/a")])
+
+        record_single_success(
+            "10.1038/never-listed",
+            manifest_path=manifest,
+            download_me_path=download_me,
+            manual_pdf_dir=drop,
+        )
+        with manifest.open() as f:
+            rows = list(csv.DictReader(f, delimiter="\t"))
+        assert [r["id"] for r in rows] == ["10.1038/a"]
+
+    def test_no_manifest_file_is_safe(self, tmp_path):
+        """Successful fetch when the queue file doesn't exist is a no-op."""
+        manifest = tmp_path / "m.tsv"
+        download_me = tmp_path / "download_me.txt"
+        drop = tmp_path / "drops"
+        record_single_success(
+            "10.1038/a",
             manifest_path=manifest,
             download_me_path=download_me,
             manual_pdf_dir=drop,

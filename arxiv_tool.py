@@ -80,7 +80,12 @@ from lit.display import (
     print_search_results as _print_search_results,
 )
 from lit.enrich import enrich_paper_ids
-from lit.batch import run_batch, run_import
+from lit.batch import (
+    record_single_failure,
+    record_single_success,
+    run_batch,
+    run_import,
+)
 from lit.fetch import Layer, walk_layers
 from lit.oa_mirror import find_oa_pdf_urls, try_download_pdf
 from lit.pdf import (
@@ -1274,6 +1279,18 @@ def _try_fulltext_for_id(id_type: str, clean_id: str) -> bool:
     return spec[0](clean_id) if spec else False
 
 
+def _fulltext_manifest_paths() -> tuple[Path, Path, Path]:
+    """Default ``(manifest, download_me, manual_pdf_dir)`` triple for the
+    work directory, used by every cmd_fulltext* path so all three stay in
+    sync. MANUAL_PDF_DIR is created on demand because download_me.txt
+    references it as the upload target."""
+    return (
+        WORK_DIR / "fulltext_failed.tsv",
+        WORK_DIR / "download_me.txt",
+        MANUAL_PDF_DIR,
+    )
+
+
 def cmd_fulltext(args):
     """Dispatch full-text fetch by ID type via ``_FULLTEXT_DISPATCH``.
 
@@ -1281,11 +1298,23 @@ def cmd_fulltext(args):
     downloaded PDF and we extract text + save to cache with the ID's
     canonical basename. Agents with Playwright MCP should use this after
     fetching content the automatic chain couldn't reach.
+
+    Failures and successes both touch the shared download_me manifest so a
+    one-off ``fulltext`` from inside an agent loop contributes to the same
+    queue ``fulltext-batch`` builds, and a successful retry quietly clears
+    a stale entry.
     """
     id_type, clean_id = extract_paper_id(args.arxiv_id)
+    manifest_path, download_me_path, manual_pdf_dir = _fulltext_manifest_paths()
 
     if args.from_file:
         _ingest_local_pdf(args.from_file, basename_for_id(id_type, clean_id))
+        record_single_success(
+            args.arxiv_id,
+            manifest_path=manifest_path,
+            download_me_path=download_me_path,
+            manual_pdf_dir=manual_pdf_dir,
+        )
         return
 
     spec = _FULLTEXT_DISPATCH.get(id_type)
@@ -1299,8 +1328,22 @@ def cmd_fulltext(args):
         sys.exit(1)
 
     try_fn, fail_hint = spec
-    if not try_fn(clean_id):
-        _fail_fulltext(fail_hint(clean_id))
+    if try_fn(clean_id):
+        record_single_success(
+            args.arxiv_id,
+            manifest_path=manifest_path,
+            download_me_path=download_me_path,
+            manual_pdf_dir=manual_pdf_dir,
+        )
+        return
+    MANUAL_PDF_DIR.mkdir(parents=True, exist_ok=True)
+    record_single_failure(
+        args.arxiv_id,
+        manifest_path=manifest_path,
+        download_me_path=download_me_path,
+        manual_pdf_dir=manual_pdf_dir,
+    )
+    _fail_fulltext(fail_hint(clean_id))
 
 
 def cmd_fulltext_batch(args):
@@ -1309,34 +1352,38 @@ def cmd_fulltext_batch(args):
     if not ids_path.exists():
         print(f"IDs file not found: {ids_path}", file=sys.stderr)
         sys.exit(1)
+    default_manifest, download_me_path, manual_pdf_dir = _fulltext_manifest_paths()
     manifest_path = (
-        Path(args.manifest).expanduser().resolve()
-        if args.manifest
-        else WORK_DIR / "fulltext_failed.tsv"
+        Path(args.manifest).expanduser().resolve() if args.manifest else default_manifest
     )
-    MANUAL_PDF_DIR.mkdir(parents=True, exist_ok=True)
+    manual_pdf_dir.mkdir(parents=True, exist_ok=True)
     run_batch(
         ids_path,
         try_fetch=_try_fulltext_for_id,
         manifest_path=manifest_path,
-        download_me_path=WORK_DIR / "download_me.txt",
-        manual_pdf_dir=MANUAL_PDF_DIR,
+        download_me_path=download_me_path,
+        manual_pdf_dir=manual_pdf_dir,
     )
 
 
 def cmd_fulltext_import(args):
     """Scan a directory for manually-downloaded PDFs and ingest each."""
+    default_manifest, download_me_path, manual_pdf_dir = _fulltext_manifest_paths()
     pdf_dir = (
-        Path(args.pdf_dir).expanduser().resolve()
-        if args.pdf_dir
-        else MANUAL_PDF_DIR
+        Path(args.pdf_dir).expanduser().resolve() if args.pdf_dir else manual_pdf_dir
     )
     manifest_path = (
         Path(args.manifest).expanduser().resolve()
         if args.manifest
-        else (WORK_DIR / "fulltext_failed.tsv" if (WORK_DIR / "fulltext_failed.tsv").exists() else None)
+        else (default_manifest if default_manifest.exists() else None)
     )
-    run_import(pdf_dir, OUTPUT_DIR, manifest_path=manifest_path)
+    run_import(
+        pdf_dir,
+        OUTPUT_DIR,
+        manifest_path=manifest_path,
+        download_me_path=download_me_path,
+        manual_pdf_dir=manual_pdf_dir,
+    )
 
 
 def main():

@@ -1,19 +1,26 @@
 """Batch full-text fetch + manual-import workflow.
 
-Two halves:
+Three halves:
 
   - :func:`run_batch` walks a list of paper IDs through the same fulltext
-    chain ``cmd_fulltext`` uses, collecting per-ID success/failure. Failed
-    IDs are written to a TSV manifest plus a human-friendly
-    ``download_me.txt`` the user can follow start-to-finish without
-    thinking about filenames or basenames.
+    chain ``cmd_fulltext`` uses, collecting per-ID success/failure.
 
-  - :func:`run_import` reads such a manifest, scans a directory for PDFs,
+  - :func:`run_import` reads a manifest, scans a directory for PDFs,
     and ingests each via the same path as ``--from-file``. Matching is
-    content-first (DOI embedded in the PDF), then filename-based, so the
-    user can drop PDFs with whatever names the browser gave them.
+    content-first (DOI embedded in the PDF), then filename-based.
 
-Both halves treat per-ID failures as data, not exceptions: one bad ID
+  - :func:`record_single_failure` / :func:`record_single_success` let
+    the interactive ``cmd_fulltext`` flow contribute to the same
+    manifest, so a single-paper failure is just as visible as a batch
+    failure and a single-paper success quietly removes a stale entry.
+
+Failed IDs land in a TSV manifest plus a human-friendly
+``download_me.txt`` the user can follow start-to-finish without thinking
+about filenames or basenames. :func:`_sync_failures` is the single
+writer for both files: every code path that mutates the failure set
+goes through it, so the manifest and download guide can never drift.
+
+All halves treat per-ID failures as data, not exceptions: one bad ID
 never aborts the run.
 """
 
@@ -138,6 +145,133 @@ def _write_download_me(
     download_me_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _read_manifest(path: Path) -> list[dict]:
+    """Read a manifest TSV, returning [] if the file is missing."""
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f, delimiter="\t"))
+
+
+def _sync_failures(
+    failures: list[dict],
+    *,
+    manifest_path: Path,
+    download_me_path: Path | None = None,
+    manual_pdf_dir: Path | None = None,
+) -> None:
+    """Single writer for the manifest TSV + ``download_me.txt`` pair.
+
+    Every code path that mutates the failure set — batch run, single-paper
+    failure, single-paper success that clears a prior entry, manual import
+    that drains the queue — funnels through here so the two files never
+    disagree. Empty ``failures`` deletes both; non-empty rewrites both.
+    """
+    if not failures:
+        _remove_quietly(manifest_path)
+        if download_me_path:
+            _remove_quietly(download_me_path)
+        return
+
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=MANIFEST_COLUMNS, delimiter="\t")
+        w.writeheader()
+        w.writerows(failures)
+    if download_me_path and manual_pdf_dir:
+        _write_download_me(
+            failures,
+            download_me_path=download_me_path,
+            manual_pdf_dir=manual_pdf_dir,
+        )
+
+
+def _build_failure_row(raw_id: str, id_type: str, clean_id: str, *, reason: str) -> dict:
+    """Shape a manifest row from a parsed ID. Single source of truth so
+    batch / single / import paths produce identical column values."""
+    if id_type == "unknown":
+        return {
+            "id": raw_id,
+            "id_type": "unknown",
+            "basename": "",
+            "url_to_try": "",
+            "reason": reason,
+        }
+    return {
+        "id": raw_id,
+        "id_type": id_type,
+        "basename": basename_for_id(id_type, clean_id),
+        "url_to_try": _publisher_url(id_type, clean_id),
+        "reason": reason,
+    }
+
+
+def record_single_failure(
+    raw_id: str,
+    *,
+    manifest_path: Path,
+    download_me_path: Path | None = None,
+    manual_pdf_dir: Path | None = None,
+) -> None:
+    """Append a single failed ID to the manifest, dedup on ``id``.
+
+    Used by the interactive ``fulltext <id>`` flow so a one-off failure
+    is just as visible as a batch failure. If the ID already has a row,
+    we keep the original (no churn); otherwise we add it and re-render.
+    """
+    id_type, clean_id = extract_paper_id(raw_id)
+    rows = _read_manifest(manifest_path)
+    if any(r.get("id") == raw_id for r in rows):
+        # Already listed — re-sync to make sure download_me.txt reflects
+        # the current manifest even if the user nuked it manually.
+        _sync_failures(
+            rows,
+            manifest_path=manifest_path,
+            download_me_path=download_me_path,
+            manual_pdf_dir=manual_pdf_dir,
+        )
+        return
+    rows.append(_build_failure_row(raw_id, id_type, clean_id, reason="automatic chain exhausted"))
+    _sync_failures(
+        rows,
+        manifest_path=manifest_path,
+        download_me_path=download_me_path,
+        manual_pdf_dir=manual_pdf_dir,
+    )
+
+
+def record_single_success(
+    raw_id: str,
+    *,
+    manifest_path: Path,
+    download_me_path: Path | None = None,
+    manual_pdf_dir: Path | None = None,
+) -> None:
+    """Drop a previously-failed ID from the manifest after a successful fetch.
+
+    Matches by ``id`` (exact) and ``basename`` (canonical), so callers
+    that pass either form (raw user input vs canonical basename) both
+    work. No-op when the ID isn't listed.
+    """
+    rows = _read_manifest(manifest_path)
+    if not rows:
+        return
+    id_type, clean_id = extract_paper_id(raw_id)
+    canonical = basename_for_id(id_type, clean_id) if id_type != "unknown" else None
+    remaining = [
+        r for r in rows
+        if r.get("id") != raw_id and (canonical is None or r.get("basename") != canonical)
+    ]
+    if len(remaining) == len(rows):
+        return  # not listed, nothing to do
+    _sync_failures(
+        remaining,
+        manifest_path=manifest_path,
+        download_me_path=download_me_path,
+        manual_pdf_dir=manual_pdf_dir,
+    )
+
+
 def run_batch(
     ids_path: Path,
     *,
@@ -169,16 +303,9 @@ def run_batch(
             file=sys.stderr,
         )
         if id_type == "unknown":
-            failures.append({
-                "id": raw_id,
-                "id_type": "unknown",
-                "basename": "",
-                "url_to_try": "",
-                "reason": "ID not parseable",
-            })
+            failures.append(_build_failure_row(raw_id, id_type, clean_id, reason="ID not parseable"))
             continue
 
-        basename = basename_for_id(id_type, clean_id)
         try:
             ok = try_fetch(id_type, clean_id)
         except Exception as e:  # noqa: BLE001 — never let one ID kill the run
@@ -188,32 +315,14 @@ def run_batch(
         if ok:
             successes += 1
         else:
-            failures.append({
-                "id": raw_id,
-                "id_type": id_type,
-                "basename": basename,
-                "url_to_try": _publisher_url(id_type, clean_id),
-                "reason": "automatic chain exhausted",
-            })
+            failures.append(_build_failure_row(raw_id, id_type, clean_id, reason="automatic chain exhausted"))
 
-    if failures:
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        with manifest_path.open("w", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=MANIFEST_COLUMNS, delimiter="\t")
-            w.writeheader()
-            w.writerows(failures)
-        if download_me_path and manual_pdf_dir:
-            _write_download_me(
-                failures,
-                download_me_path=download_me_path,
-                manual_pdf_dir=manual_pdf_dir,
-            )
-    else:
-        # Clean up stale manifest / download guide from previous runs so the
-        # user never stares at an obsolete URL list.
-        _remove_quietly(manifest_path)
-        if download_me_path:
-            _remove_quietly(download_me_path)
+    _sync_failures(
+        failures,
+        manifest_path=manifest_path,
+        download_me_path=download_me_path,
+        manual_pdf_dir=manual_pdf_dir,
+    )
 
     print(
         f"\nBatch done: {successes} ok, {len(failures)} failed.",
@@ -231,18 +340,13 @@ def run_batch(
     return successes, len(failures)
 
 
-def _read_manifest(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    with path.open("r", encoding="utf-8", newline="") as f:
-        return list(csv.DictReader(f, delimiter="\t"))
-
-
 def run_import(
     pdf_dir: Path,
     output_dir: Path,
     *,
     manifest_path: Path | None = None,
+    download_me_path: Path | None = None,
+    manual_pdf_dir: Path | None = None,
 ) -> tuple[int, int]:
     """Scan ``pdf_dir`` for PDFs and ingest each into ``output_dir``.
 
@@ -261,6 +365,13 @@ def run_import(
     ``.txt`` present in ``output_dir``) are skipped; dropping the same
     PDF twice never overwrites a richer structured format.
 
+    When ``manifest_path`` and ``download_me_path`` are both provided,
+    successfully-ingested basenames are dropped from the manifest and
+    ``download_me.txt`` is re-rendered with the remaining failures (or
+    deleted along with the manifest when nothing remains). This keeps
+    the user-facing download guide in sync after they finish manually
+    pulling the paywalled papers.
+
     Returns ``(imported_count, skipped_count)``.
     """
     pdf_dir = pdf_dir.expanduser().resolve()
@@ -273,6 +384,7 @@ def run_import(
 
     imported = 0
     skipped = 0
+    ingested_basenames: set[str] = set()
     for pdf in sorted(pdf_dir.glob("*.pdf")):
         basename = _resolve_basename(pdf, by_basename)
         if basename is None:
@@ -289,11 +401,30 @@ def run_import(
             )
             _remove_quietly(pdf)
             skipped += 1
+            ingested_basenames.add(basename)  # already-cached counts as resolved
             continue
         print(f"  → ingesting {pdf.name} as {basename}", file=sys.stderr)
         ingest_local_pdf(str(pdf), basename, output_dir)
         _remove_quietly(pdf)  # cached copy in output_dir is canonical
         imported += 1
+        ingested_basenames.add(basename)
+
+    if manifest_path and manifest and ingested_basenames:
+        remaining = [r for r in manifest if r.get("basename") not in ingested_basenames]
+        if len(remaining) != len(manifest):
+            _sync_failures(
+                remaining,
+                manifest_path=manifest_path,
+                download_me_path=download_me_path,
+                manual_pdf_dir=manual_pdf_dir,
+            )
+            cleared = len(manifest) - len(remaining)
+            tail = (
+                f"download guide cleared ({cleared} resolved, queue empty)."
+                if not remaining
+                else f"download guide updated ({cleared} resolved, {len(remaining)} still pending)."
+            )
+            print(tail, file=sys.stderr)
 
     print(f"\nImport done: {imported} ingested, {skipped} skipped.", file=sys.stderr)
     return imported, skipped
