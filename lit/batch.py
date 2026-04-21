@@ -37,13 +37,14 @@ from lit.ids import basename_for_id, extract_paper_id
 from lit.pdf import extract_doi_from_pdf, ingest_local_pdf, is_pdf_bytes
 
 
-# ChemRxiv (and a few other preprint servers) issue versioned DOIs of the
-# form ``10.x/preprint-id/v2``. After ``basename_for_id`` collapses ``/``
-# to ``_`` that becomes ``..._v2``. The bare form is the same underlying
-# preprint, so a queue listing the bare form is satisfied by ingesting any
-# version. Match anchored at end so we don't strip incidental ``_v\d`` that
-# happens to be part of a real ID body.
-_VERSION_SUFFIX_RE = re.compile(r"_v\d+$")
+# ChemRxiv (and a few other preprint servers) issue versioned DOIs in two
+# observed shapes: ``10.x/preprint-id/v2`` (slash-joined) and
+# ``10.x/preprint-id-v2`` (hyphen-joined). After ``basename_for_id``
+# collapses ``/`` to ``_`` those become ``..._v2`` and ``...-v2``. The bare
+# form is the same underlying preprint, so a queue listing the bare form is
+# satisfied by ingesting any version. Anchor at end so we don't strip an
+# incidental ``[-_]v\d`` that happens to be part of a real ID body.
+_VERSION_SUFFIX_RE = re.compile(r"[-_]v\d+$")
 
 
 def _basename_aliases(basename: str) -> set[str]:

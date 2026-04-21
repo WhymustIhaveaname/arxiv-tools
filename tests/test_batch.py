@@ -638,8 +638,16 @@ class TestBasenameAliases:
             "10.26434_chemrxiv-2025-0g4wn",
         }
 
+    def test_hyphen_versioned_chemrxiv_aliases_to_bare(self):
+        """ChemRxiv also mints DOIs like ``...-v4`` (hyphen, not slash);
+        basename keeps the hyphen and must still alias to the bare form."""
+        assert _basename_aliases("10.26434_chemrxiv-2024-zz9pw-v4") == {
+            "10.26434_chemrxiv-2024-zz9pw-v4",
+            "10.26434_chemrxiv-2024-zz9pw",
+        }
+
     def test_only_strips_anchored_at_end(self):
-        """``_v2`` mid-string must not be touched — that's a real ID body."""
+        """Mid-string ``[-_]v\\d`` must not be touched — that's a real ID body."""
         assert _basename_aliases("10.1234_abc_v2_def") == {"10.1234_abc_v2_def"}
 
 
