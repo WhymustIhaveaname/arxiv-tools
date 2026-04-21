@@ -56,6 +56,7 @@ autodetects.
 | arXiv LaTeX source only | `tex <arxiv-id>` |
 | Paper full text onto disk (any ID type) | `fulltext <id>` |
 | Bulk fulltext over a list of IDs | `fulltext-batch <ids.txt>` |
+| Audit a doc: fetch every paper id it cites | `fulltext-sweep <file.md> [...]` |
 | Ingest PDFs you already have | `fulltext-import <dir>` |
 
 ## Canonical cache layout
@@ -83,6 +84,28 @@ After every `fulltext` call, read the highest-priority file that exists for
 that basename. When only `.txt` exists the paper is still fully readable;
 structured formats are preferred because they preserve section boundaries.
 </cache>
+
+## Citations in written output — fulltext, not info
+
+<citations>
+Call `fulltext <id>` (not just `info <id>`) for any paper you cite in a doc you
+write — idea, review, proposal, landscape summary, final paper. `info` returns
+the metadata-aggregator abstract, which is often truncated or subtly mismatched
+with the paper's actual claims; citing from abstract lets false novelty and
+differentiation slip through a review, and it silently bypasses the
+`download_me.txt` handoff that `fulltext` generates when a PDF is paywalled or
+CF-locked — so unreachable papers never surface to the user.
+
+`info` remains the right tool for quick triage: skimming search hits, confirming
+a paper exists at the ID the user gave, checking year / authors for a
+bibliography. Upgrade to `fulltext` the moment you decide to cite.
+
+When a doc is finished and you want one safety sweep, run
+`fulltext-sweep <doc>` — it scans the file for arxiv / DOI / PMC ids, dedupes,
+and batches them through the same pipeline as `fulltext-batch`. Cached refs
+auto-skip; only new ones hit the network. Use this at end of a writing task so
+any missed fulltext surfaces to the user in the usual `download_me.txt`.
+</citations>
 
 ## Full-text retrieval — the main workflow
 

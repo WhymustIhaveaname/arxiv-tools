@@ -1366,6 +1366,63 @@ def cmd_fulltext_batch(args):
     )
 
 
+def cmd_fulltext_sweep(args):
+    """Scan markdown / text files for paper IDs and batch-fetch each through fulltext.
+
+    End-of-task audit: after writing a doc that cites N papers (idea, review, landscape,
+    proposal), run `fulltext-sweep <doc> [<doc>...]` to ensure every cited paper has
+    fulltext on disk. Already-cached IDs auto-skip, only new ones hit the network.
+    Failures land in the usual `fulltext_failed.tsv` + `download_me.txt` for manual
+    handoff, identical to `fulltext-batch`.
+    """
+    import re
+    import tempfile
+
+    files = [Path(p).expanduser().resolve() for p in args.files]
+    missing = [str(f) for f in files if not f.exists()]
+    if missing:
+        print(f"File not found: {missing[0]}", file=sys.stderr)
+        sys.exit(1)
+
+    arxiv_pat = re.compile(r"(?:arXiv[:\s]*|arxiv[:\s]*)(\d{4}\.\d{4,5})", re.I)
+    doi_pat = re.compile(r"\b(10\.\d{4,9}/[A-Za-z0-9._/\-]+[A-Za-z0-9])")
+    pmc_pat = re.compile(r"\bPMC\d{5,}\b")
+
+    ids: set[str] = set()
+    for f in files:
+        text = f.read_text(errors="replace")
+        ids |= set(arxiv_pat.findall(text))
+        for m in doi_pat.findall(text):
+            m = m.rstrip(".,;:)]")
+            if "/" in m:
+                ids.add(m)
+        ids |= set(pmc_pat.findall(text))
+
+    if not ids:
+        print(f"fulltext-sweep: no paper IDs in {len(files)} file(s).")
+        return
+
+    print(f"fulltext-sweep: {len(ids)} unique IDs across {len(files)} file(s).")
+    with tempfile.NamedTemporaryFile("w", suffix="_ids.txt", delete=False) as fh:
+        fh.write("\n".join(sorted(ids)) + "\n")
+        ids_path = Path(fh.name)
+    try:
+        default_manifest, download_me_path, manual_pdf_dir = _fulltext_manifest_paths()
+        manifest_path = (
+            Path(args.manifest).expanduser().resolve() if args.manifest else default_manifest
+        )
+        manual_pdf_dir.mkdir(parents=True, exist_ok=True)
+        run_batch(
+            ids_path,
+            try_fetch=_try_fulltext_for_id,
+            manifest_path=manifest_path,
+            download_me_path=download_me_path,
+            manual_pdf_dir=manual_pdf_dir,
+        )
+    finally:
+        ids_path.unlink(missing_ok=True)
+
+
 def cmd_fulltext_import(args):
     """Scan a directory for manually-downloaded PDFs and ingest each."""
     default_manifest, download_me_path, manual_pdf_dir = _fulltext_manifest_paths()
@@ -1536,6 +1593,20 @@ def main():
         help="失败 ID 的输出 TSV 路径 (默认 OUTPUT_DIR/fulltext_failed.tsv)",
     )
     batch_parser.set_defaults(func=cmd_fulltext_batch)
+
+    sweep_parser = subparsers.add_parser(
+        "fulltext-sweep",
+        help="扫 markdown/text 文件抽出引用的 paper ID, 批量下全文 (end-of-task 审计)",
+    )
+    sweep_parser.add_argument(
+        "files", nargs="+",
+        help="一个或多个 markdown / 纯文本文件, 混抽 arxiv / DOI / PMC ID, 去重后批量 fulltext",
+    )
+    sweep_parser.add_argument(
+        "--manifest", metavar="PATH",
+        help="失败 ID 的输出 TSV 路径 (默认 OUTPUT_DIR/fulltext_failed.tsv)",
+    )
+    sweep_parser.set_defaults(func=cmd_fulltext_sweep)
 
     import_parser = subparsers.add_parser(
         "fulltext-import",
