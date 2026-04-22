@@ -1130,6 +1130,7 @@ class TestGetPaperInfo:
 class TestFetchPaperSources:
     """三个数据源的独立测试 + 一致性验证"""
 
+    @pytest.mark.skipif(not arxiv_tool.OPENALEX_ENABLED, reason="OpenAlex disabled")
     def test_openalex_returns_paper(self):
         result = arxiv_tool._fetch_paper_openalex(TEST_ID)
         assert result is not None
@@ -1148,6 +1149,7 @@ class TestFetchPaperSources:
         assert TEST_TITLE in result.title
         assert result.categories  # 只有 arXiv 源有 categories
 
+    @pytest.mark.skipif(not arxiv_tool.OPENALEX_ENABLED, reason="OpenAlex disabled")
     def test_sources_consistent(self):
         """三个源返回的 title 和第一作者应一致"""
         oa = arxiv_tool._fetch_paper_openalex(TEST_ID)
@@ -1162,6 +1164,7 @@ class TestFetchPaperSources:
         assert oa.authors[0].name == ar.authors[0].name
         assert s2.authors[0].name == ar.authors[0].name
 
+    @pytest.mark.skipif(not arxiv_tool.OPENALEX_ENABLED, reason="OpenAlex disabled")
     def test_bibtex_year_from_arxiv_id(self):
         """无论哪个源，BibTeX year 都应从 arXiv ID 提取"""
         oa = arxiv_tool._fetch_paper_openalex(TEST_ID)
@@ -1317,6 +1320,7 @@ class TestCitedSemanticScholar:
 class TestCitedOpenAlex:
     """被引反查 - OpenAlex"""
 
+    @pytest.mark.skipif(not arxiv_tool.OPENALEX_ENABLED, reason="OpenAlex disabled")
     def test_resolve_openalex_id(self):
         resolved = arxiv_tool._resolve_openalex_id(TEST_ID)
         assert resolved is not None
@@ -1325,6 +1329,7 @@ class TestCitedOpenAlex:
         assert "attention" in title.lower()
         assert cited_by > 0
 
+    @pytest.mark.skipif(not arxiv_tool.OPENALEX_ENABLED, reason="OpenAlex disabled")
     def test_returns_citations(self):
         ret = arxiv_tool._fetch_citations_openalex(TEST_ID, max_results=5)
         assert ret is not None
@@ -1334,6 +1339,7 @@ class TestCitedOpenAlex:
         for work in results:
             assert work.get("title")
 
+    @pytest.mark.skipif(not arxiv_tool.OPENALEX_ENABLED, reason="OpenAlex disabled")
     def test_respects_max_results(self):
         ret = arxiv_tool._fetch_citations_openalex(TEST_ID, max_results=3)
         assert ret is not None
