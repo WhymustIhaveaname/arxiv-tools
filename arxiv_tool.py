@@ -18,12 +18,14 @@ arXiv 论文搜索与全文获取工具
 3. bib - 生成 BibTeX 引用（自动生成 citation key）
 4. tex - 下载 LaTeX 源文件并解压（失败时自动 fallback 到 PDF 下载）
 5. cited - 被引反查（Semantic Scholar 首选，OpenAlex 备选）
+6. infotex - info + tex 组合：先打印论文信息，再下载 LaTeX
 
 使用方法（通过 uv run）：
     uv run arxiv_tool.py search "PINN" --max 5
     uv run arxiv_tool.py info 2401.12345
     uv run arxiv_tool.py bib 2401.12345 -o refs.bib
     uv run arxiv_tool.py tex 2401.12345
+    uv run arxiv_tool.py infotex 2401.12345
     uv run arxiv_tool.py cited 1711.10561 --max 20
     uv run arxiv_tool.py cited 1711.10561 --offset 20  # 翻页
     uv run arxiv_tool.py cited 1711.10561 --source openalex
@@ -1225,6 +1227,13 @@ def cmd_tex(args):
         _fetch_pdf_fallback(args.arxiv_id, OUTPUT_DIR)
 
 
+def cmd_infotex(args):
+    """info + tex 组合：先打印论文元信息，再下载 LaTeX 源文件。"""
+    cmd_info(args)
+    print()  # 空行分隔 info 与 tex 两段输出
+    cmd_tex(args)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="arXiv 论文搜索与全文获取工具",
@@ -1236,6 +1245,7 @@ def main():
     %(prog)s bib 2505.08783
     %(prog)s bib 2505.08783 -o references.bib
     %(prog)s tex 2505.08783
+    %(prog)s infotex 2505.08783
     %(prog)s cited 1711.10561
     %(prog)s cited 1711.10561 --max 50
     %(prog)s cited 1711.10561 --offset 20          # 第 21-40 条
@@ -1302,6 +1312,11 @@ def main():
     tex_parser = subparsers.add_parser("tex", help="下载 LaTeX 源文件并解压")
     tex_parser.add_argument("arxiv_id", help="arXiv ID")
     tex_parser.set_defaults(func=cmd_tex)
+
+    # infotex 子命令
+    infotex_parser = subparsers.add_parser("infotex", help="info + tex 组合：先打印论文信息，再下载 LaTeX")
+    infotex_parser.add_argument("arxiv_id", help="arXiv ID")
+    infotex_parser.set_defaults(func=cmd_infotex)
 
     args = parser.parse_args()
     try:

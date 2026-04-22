@@ -8,7 +8,7 @@ description: >
 
 # arXiv Paper Search and Analysis
 
-Five subcommands available: search (find papers), info (metadata), tex (download full text), bib (BibTeX), cited (reverse citation lookup).
+Six subcommands available: search (find papers), info (metadata), tex (download full text), infotex (info + tex combined), bib (BibTeX), cited (reverse citation lookup).
 
 ## How to run
 
@@ -49,6 +49,8 @@ S2 bulk search (up to 1000 results, supports sorting and pagination):
 uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" info <arXiv ID>
 ```
 
+Prints the metadata (title, authors, date, categories, PDF URL, abstract).
+
 ### tex — download full paper source
 
 ```bash
@@ -56,6 +58,14 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" tex <arXiv ID>
 ```
 
 Downloads the tex source and returns the directory path and structure, preserving full LaTeX formatting and figures. If the source is unavailable, falls back to PDF download and text extraction.
+
+### infotex — info + tex combined
+
+```bash
+uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" infotex <arXiv ID>
+```
+
+Runs `info` then `tex` in sequence on a single paper. Use this when you want both the at-a-glance context and the full text in one shot.
 
 ### bib — generate BibTeX citation
 
@@ -83,6 +93,7 @@ uv run "${CLAUDE_PLUGIN_ROOT}/arxiv_tool.py" cited <arXiv ID> --source s2|openal
 | cited | S2 → OpenAlex |
 | info / bib | local cache → OpenAlex → S2 → arXiv |
 | tex | local cache → arXiv |
+| infotex | info fallback, then tex fallback (runs sequentially) |
 
 - search/cited prefer S2: more complete citation data
 - info/bib prefer OpenAlex: most lenient rate limit (0.1s/req vs S2 2s vs arXiv 5s)

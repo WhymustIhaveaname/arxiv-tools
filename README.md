@@ -50,6 +50,21 @@ export ARXIV_CACHE_DIR="/shared/arxiv-cache"
 
 缓存目录存放：下载的 tex/PDF 源文件、SQLite 元数据数据库、限流锁文件、API key（`.env`）。共享后只要有一个人下载过某篇论文，其他人直接命中缓存。
 
+## 开发 / 测试
+
+`arxiv_tool.py` 用 PEP 723 inline metadata 声明运行时依赖, 只有通过 `uv run arxiv_tool.py ...` 才会自动装. 测试因为直接 `import arxiv_tool`, pytest 裸跑会 `ModuleNotFoundError: requests` 之类. 跑测试请用 `requirements-dev.txt`:
+
+```bash
+# 方法 A: uv 一键 (推荐, 不污染全局)
+uv run --with-requirements requirements-dev.txt pytest -q tests/
+
+# 方法 B: pip 安装后常规 pytest
+pip install -r requirements-dev.txt
+pytest -q tests/
+```
+
+`requirements-dev.txt` 里的运行时依赖段必须和 `arxiv_tool.py` 顶部的 PEP 723 block 保持同步.
+
 ## 技术细节
 
 - **本地是不是有一个 sql 数据库协调用的?** 是，`paper_cache.py` 用 SQLite，数据库文件在 `.arxiv/paper_cache.db`。`papers` 表存论文元数据（标题、作者、摘要、日期、分类、PDF URL）和 BibTeX，用 `arxiv_id` 做主键。`get_paper_info()` 先查缓存，命中就不调 API；未命中走 OpenAlex → S2 → arXiv 三级 fallback。
