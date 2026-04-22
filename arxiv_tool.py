@@ -71,6 +71,13 @@ CONTACT_EMAIL: str = os.environ.get("CONTACT_EMAIL", "")
 S2_API_BASE = "https://api.semanticscholar.org/graph/v1"
 OPENALEX_API_BASE = "https://api.openalex.org"
 
+# Feature flag: OpenAlex 上游 metadata 污染 (e.g. arXiv:2001.08361 Kaplan Scaling Laws 的 abstract
+# 被替换成 LLM-生成的 agentic AI theory 段落; title/authors 正确 但 abstract swap). 背景见
+# 2024 年 Crossref fabricated-metadata 事件, Springer/Elsevier 2025 从 OpenAlex 撤 abstract,
+# ICLR 2026 20% submissions 含 AI 幻觉 citation. S2 和 arXiv 干净.
+# 暂时 disable, 所有 fetch/search/cited 入口早 return None 走 fallback. 代码/token 保留.
+OPENALEX_ENABLED = False
+
 # HTTP 请求头（arXiv 推荐设置 User-Agent）
 _mailto = f" (mailto:{CONTACT_EMAIL})" if CONTACT_EMAIL else ""
 HTTP_HEADERS = {
@@ -213,6 +220,8 @@ def _fetch_paper_s2(arxiv_id: str) -> CachedPaper | None:
 
 def _fetch_paper_openalex(arxiv_id: str) -> CachedPaper | None:
     """Fetch paper metadata from OpenAlex"""
+    if not OPENALEX_ENABLED:
+        return None
     doi = f"10.48550/arXiv.{arxiv_id}"
     url = f"{OPENALEX_API_BASE}/works/doi:{doi}"
     try:
@@ -1000,6 +1009,8 @@ def _search_openalex(query: str, max_results: int = 10) -> list[dict] | None:
         论文列表 [{"title", "publication_year", "authorships", "cited_by_count", "ids", ...}]，
         失败返回 None
     """
+    if not OPENALEX_ENABLED:
+        return None
     url = f"{OPENALEX_API_BASE}/works"
     try:
         resp = _request_with_retry(
@@ -1088,6 +1099,8 @@ def _resolve_openalex_id(arxiv_id: str) -> tuple[str, str, int] | None:
     Returns:
         (openalex_work_id, 论文标题, 被引次数)，失败返回 None
     """
+    if not OPENALEX_ENABLED:
+        return None
     doi = f"10.48550/arXiv.{arxiv_id}"
     url = f"{OPENALEX_API_BASE}/works/doi:{doi}"
     try:
@@ -1107,6 +1120,8 @@ def _fetch_citations_openalex(
     Returns:
         (引用论文列表, 总被引次数)，失败返回 None
     """
+    if not OPENALEX_ENABLED:
+        return None
     resolved = _resolve_openalex_id(arxiv_id)
     if not resolved:
         print("OpenAlex: paper not found", file=sys.stderr)
