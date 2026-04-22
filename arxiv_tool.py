@@ -37,6 +37,7 @@ import argparse
 import fcntl
 import gzip
 import io
+import json
 import os
 import re
 import shutil
@@ -77,6 +78,30 @@ OPENALEX_API_BASE = "https://api.openalex.org"
 # ICLR 2026 20% submissions 含 AI 幻觉 citation. S2 和 arXiv 干净.
 # 暂时 disable, 所有 fetch/search/cited 入口早 return None 走 fallback. 代码/token 保留.
 OPENALEX_ENABLED = False
+
+# Audit log: append one JSONL line per CLI invocation to CACHE_DIR/.audit.jsonl.
+# 共享文件, 多进程安全 (append on POSIX is atomic for <4KB, single JSON line 远小于此).
+# 用于回答诸如 "tex vs info 比例" / "search 关键词 top-N" / "cited 有没有人用" 之类统计.
+AUDIT_LOG = CACHE_DIR / ".audit.jsonl"
+
+# 模块级 var: 每个 fetch/search/cited 成功路径把自己的来源标签写进来,
+# main() 的 audit wrapper 读取后写进 log 的 source_hit 字段.
+_LAST_SOURCE: str = "unknown"
+
+
+def _set_source(src: str) -> None:
+    """Fetcher 成功返回前 call 这个函数打标, audit wrapper 最后读."""
+    global _LAST_SOURCE
+    _LAST_SOURCE = src
+
+
+def _write_audit_entry(entry: dict) -> None:
+    """Append 一行 JSON 到 AUDIT_LOG. 失败静默, 不让 audit 打断工具主流程."""
+    try:
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
 
 # HTTP 请求头（arXiv 推荐设置 User-Agent）
 _mailto = f" (mailto:{CONTACT_EMAIL})" if CONTACT_EMAIL else ""
@@ -290,13 +315,19 @@ def get_paper_info(arxiv_id: str) -> CachedPaper | None:
 
     cached = get_cached_paper(clean_id)
     if cached:
+        _set_source("cache")
         return cached
 
-    paper = (
-        _fetch_paper_openalex(clean_id)
-        or _fetch_paper_s2(clean_id)
-        or _fetch_paper_arxiv(clean_id)
-    )
+    paper = None
+    for name, fetcher in (
+        ("openalex", _fetch_paper_openalex),
+        ("s2", _fetch_paper_s2),
+        ("arxiv", _fetch_paper_arxiv),
+    ):
+        paper = fetcher(clean_id)
+        if paper:
+            _set_source(name)
+            break
 
     if not paper:
         print(f"Paper not found: {clean_id}", file=sys.stderr)
@@ -519,6 +550,8 @@ def cmd_search(args):
         return
 
     source_name, normalized = results
+    # Audit tag: 取 source_name 首单词 (e.g. "Semantic Scholar (bulk)" -> "semantic", "arXiv" -> "arxiv")
+    _set_source(source_name.split()[0].lower())
     print(f"\nFound {len(normalized)} papers ({source_name}):\n")
     _print_search_results(normalized)
 
@@ -1218,6 +1251,9 @@ def cmd_cited(args):
         print(f"\nNo citations found for arXiv:{clean_id}")
         return
 
+    # Audit tag: "Semantic Scholar" / "OpenAlex" -> first word lowercased
+    _set_source(used_source.split()[0].lower())
+
     start_num = offset + 1
     end_num = offset + len(results)
     print(f"\nSource: {used_source}")
@@ -1230,14 +1266,24 @@ def cmd_cited(args):
 
 
 def cmd_tex(args):
+    # Audit: 判断是否 cache hit (fetch_tex_source 前已存在目录)
+    # dir naming 规则必须与 fetch_tex_source L798 保持一致, 否则带版本 id / 老格式 id 会误标.
+    clean_id = extract_arxiv_id(args.arxiv_id)
+    _dir_id = re.sub(r"v\d+$", "", clean_id).replace("/", "_")
+    _was_cached = (OUTPUT_DIR / _dir_id).exists() or any(
+        p.is_dir() for p in OUTPUT_DIR.glob(f"{_dir_id}_*")
+    )
+
     result = fetch_tex_source(args.arxiv_id, OUTPUT_DIR)
     if result:
+        _set_source("cache" if _was_cached else "arxiv")
         print("\nDirectory structure:")
         print(result.name)
         tree_lines = print_tree(result)
         for line in tree_lines:
             print(line)
     else:
+        _set_source("pdf_fallback")
         print("\ntex download failed, falling back to PDF...", file=sys.stderr)
         _fetch_pdf_fallback(args.arxiv_id, OUTPUT_DIR)
 
@@ -1334,17 +1380,45 @@ def main():
     infotex_parser.set_defaults(func=cmd_infotex)
 
     args = parser.parse_args()
+
+    # Audit: 记录调用元数据, 成功/异常都写一行 JSONL
+    _started = time.time()
+    _exit_code = 0
+    global _LAST_SOURCE
+    _LAST_SOURCE = "unknown"
+    _arg = getattr(args, "arxiv_id", None) or getattr(args, "query", None) or ""
+    _flags = {
+        k: v for k, v in vars(args).items()
+        if k not in ("command", "func", "arxiv_id", "query")
+        and v is not None and v is not False
+    }
+
     try:
         args.func(args)
     except KeyboardInterrupt:
-        sys.exit(130)
+        _exit_code = 130
     except arxiv.HTTPError as e:
         # arxiv.HTTPError.__str__ 带完整 URL，只取 HTTP 状态码
         print(f"Error: arXiv HTTP {e.status}", file=sys.stderr)
-        sys.exit(1)
+        _exit_code = 1
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        _exit_code = 1
+    finally:
+        _write_audit_entry({
+            "ts": _datetime.now().isoformat(timespec="seconds"),
+            "user": os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown",
+            "cmd": args.command,
+            "arg": _arg,
+            "flags": _flags,
+            "source_hit": _LAST_SOURCE,
+            "cached_before": _LAST_SOURCE == "cache",
+            "elapsed_s": round(time.time() - _started, 3),
+            "exit_code": _exit_code,
+        })
+
+    if _exit_code:
+        sys.exit(_exit_code)
 
 
 if __name__ == "__main__":
