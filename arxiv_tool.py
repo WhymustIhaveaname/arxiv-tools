@@ -527,7 +527,7 @@ def cmd_search(args):
             if raw:
                 results = ("Semantic Scholar", _normalize_s2_search(raw))
 
-    if not results and source in ("openalex", "auto"):
+    if not results and source in ("openalex", "auto") and OPENALEX_ENABLED:
         print("Searching OpenAlex...", file=sys.stderr)
         raw = _search_openalex(args.query, args.max)
         if raw:
@@ -1237,7 +1237,7 @@ def cmd_cited(args):
             results, _total = ret
             used_source = "Semantic Scholar"
 
-    if results is None and source in ("openalex", "auto"):
+    if results is None and source in ("openalex", "auto") and OPENALEX_ENABLED:
         if source == "auto":
             print("\nSemantic Scholar failed, switching to OpenAlex...")
         else:

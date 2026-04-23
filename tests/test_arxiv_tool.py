@@ -808,7 +808,8 @@ class TestCmdCited:
     def test_openalex_forced(self, capsys):
         """--source openalex 只调 OpenAlex"""
         fake_results = [{"title": "Paper X", "authorships": [], "cited_by_count": 10, "publication_year": 2020}]
-        with patch("arxiv_tool._fetch_citations_s2") as mock_s2, \
+        with patch("arxiv_tool.OPENALEX_ENABLED", True), \
+             patch("arxiv_tool._fetch_citations_s2") as mock_s2, \
              patch("arxiv_tool._fetch_citations_openalex", return_value=(fake_results, 50)) as mock_oa:
             arxiv_tool.cmd_cited(self._make_args(source="openalex"))
             mock_s2.assert_not_called()
@@ -821,7 +822,8 @@ class TestCmdCited:
     def test_auto_fallback_s2_to_openalex(self, capsys):
         """auto 模式: S2 失败后回退到 OpenAlex"""
         fake_results = [{"title": "Fallback Paper", "authorships": [], "cited_by_count": 5, "publication_year": 2021}]
-        with patch("arxiv_tool._fetch_citations_s2", return_value=None) as mock_s2, \
+        with patch("arxiv_tool.OPENALEX_ENABLED", True), \
+             patch("arxiv_tool._fetch_citations_s2", return_value=None) as mock_s2, \
              patch("arxiv_tool._fetch_citations_openalex", return_value=(fake_results, 30)) as mock_oa:
             arxiv_tool.cmd_cited(self._make_args(source="auto"))
             mock_s2.assert_called_once()
@@ -843,6 +845,18 @@ class TestCmdCited:
         out = capsys.readouterr().out
         assert "Semantic Scholar" in out
         assert "S2 Paper" in out
+
+    def test_auto_skips_openalex_output_when_disabled(self, capsys):
+        """OpenAlex disabled 时不打印切换提示，也不调用 OpenAlex cited fetch"""
+        with patch("arxiv_tool._fetch_citations_s2", return_value=None) as mock_s2, \
+             patch("arxiv_tool._fetch_citations_openalex") as mock_oa:
+            arxiv_tool.cmd_cited(self._make_args(source="auto"))
+            mock_s2.assert_called_once()
+            mock_oa.assert_not_called()
+
+        captured = capsys.readouterr()
+        assert "switching to OpenAlex" not in captured.out
+        assert "Querying OpenAlex" not in captured.out
 
     def test_both_fail(self, capsys):
         """两个数据源都失败"""
@@ -895,6 +909,18 @@ class TestCmdSearch:
         assert "Test Paper" in out
         assert "Alice" in out
         assert "2024-03-15" in out
+
+    def test_auto_skips_openalex_output_when_disabled(self, capsys):
+        """OpenAlex disabled 时不打印其搜索提示，直接走 arXiv fallback"""
+        with patch("arxiv_tool._search_s2", return_value=None), \
+             patch("arxiv_tool._search_openalex") as mock_oa, \
+             patch("arxiv_tool.search_papers", return_value=[]):
+            args = argparse.Namespace(query="test", max=5, source="auto")
+            arxiv_tool.cmd_search(args)
+
+        captured = capsys.readouterr()
+        assert "Searching OpenAlex..." not in captured.err
+        mock_oa.assert_not_called()
 
 
 # ════════════════════════════════════════════════════════════════════
