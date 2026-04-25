@@ -618,6 +618,9 @@ def cmd_info(args):
     if paper.categories:
         print(f"Categories: {', '.join(paper.categories)}")
     print(f"PDF: {paper.pdf_url}")
+    cached_tex = _find_cached_tex_dir(clean_id)
+    if cached_tex:
+        print(f"Tex (cached): {cached_tex}")
     print(f"\nAbstract:\n{paper.abstract}")
 
 
@@ -783,6 +786,24 @@ def print_tree(
             )
 
     return lines
+
+
+def _find_cached_tex_dir(arxiv_id: str) -> Path | None:
+    """返回已下载的 tex 解压目录路径; 没有则 None. 不发请求.
+
+    优先精确 dir_id 命中, 退化到 dir_id_<title> glob (fetch_tex_source 解压后
+    会把 title slug 加进目录名). 命名规则与 fetch_tex_source / cmd_tex 必须
+    保持一致 — 三处共享此 helper.
+    """
+    clean_id = extract_arxiv_id(arxiv_id)
+    dir_id = re.sub(r"v\d+$", "", clean_id).replace("/", "_")
+    exact = OUTPUT_DIR / dir_id
+    if exact.is_dir():
+        return exact
+    for p in OUTPUT_DIR.glob(f"{dir_id}_*"):
+        if p.is_dir():
+            return p
+    return None
 
 
 def fetch_tex_source(arxiv_id: str, output_dir: Path) -> Path | None:
@@ -1280,13 +1301,8 @@ def cmd_cited(args):
 
 
 def cmd_tex(args):
-    # Audit: 判断是否 cache hit (fetch_tex_source 前已存在目录)
-    # dir naming 规则必须与 fetch_tex_source L798 保持一致, 否则带版本 id / 老格式 id 会误标.
-    clean_id = extract_arxiv_id(args.arxiv_id)
-    _dir_id = re.sub(r"v\d+$", "", clean_id).replace("/", "_")
-    _was_cached = (OUTPUT_DIR / _dir_id).exists() or any(
-        p.is_dir() for p in OUTPUT_DIR.glob(f"{_dir_id}_*")
-    )
+    # Audit: 判断是否 cache hit (fetch_tex_source 前已存在目录).
+    _was_cached = _find_cached_tex_dir(args.arxiv_id) is not None
 
     result = fetch_tex_source(args.arxiv_id, OUTPUT_DIR)
     if result:

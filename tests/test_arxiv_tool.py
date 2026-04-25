@@ -673,6 +673,52 @@ class TestCmdInfo:
         assert "Authors" not in out
         assert "arXiv ID" not in out
 
+    def test_no_cached_tex_no_line(self, tmp_path, capsys, monkeypatch):
+        """本地无 tex 缓存时, 输出里不出现 'Tex (cached)' 行 — 不发额外请求"""
+        monkeypatch.setattr(arxiv_tool, "OUTPUT_DIR", tmp_path)
+        with patch("arxiv_tool.get_paper_info", return_value=MOCK_PAPER):
+            args = argparse.Namespace(arxiv_id=TEST_ID)
+            arxiv_tool.cmd_info(args)
+
+        out = capsys.readouterr().out
+        assert "Tex (cached)" not in out
+
+    def test_cached_tex_dir_exact_match(self, tmp_path, capsys, monkeypatch):
+        """精确 dir_id 命中: <OUTPUT_DIR>/<id> 存在则附带 path"""
+        monkeypatch.setattr(arxiv_tool, "OUTPUT_DIR", tmp_path)
+        cached = tmp_path / TEST_ID
+        cached.mkdir()
+        with patch("arxiv_tool.get_paper_info", return_value=MOCK_PAPER):
+            args = argparse.Namespace(arxiv_id=TEST_ID)
+            arxiv_tool.cmd_info(args)
+
+        out = capsys.readouterr().out
+        assert f"Tex (cached): {cached}" in out
+
+    def test_cached_tex_dir_title_suffix(self, tmp_path, capsys, monkeypatch):
+        """fetch_tex_source 解压后的 dir_<title> glob 也应识别"""
+        monkeypatch.setattr(arxiv_tool, "OUTPUT_DIR", tmp_path)
+        cached = tmp_path / f"{TEST_ID}_Attention_Is_All_You_Need"
+        cached.mkdir()
+        with patch("arxiv_tool.get_paper_info", return_value=MOCK_PAPER):
+            args = argparse.Namespace(arxiv_id=TEST_ID)
+            arxiv_tool.cmd_info(args)
+
+        out = capsys.readouterr().out
+        assert f"Tex (cached): {cached}" in out
+
+    def test_cached_tex_strips_version(self, tmp_path, capsys, monkeypatch):
+        """带版本号查询 (1706.03762v5) 应命中无版本目录"""
+        monkeypatch.setattr(arxiv_tool, "OUTPUT_DIR", tmp_path)
+        cached = tmp_path / TEST_ID  # 无版本号目录
+        cached.mkdir()
+        with patch("arxiv_tool.get_paper_info", return_value=MOCK_PAPER):
+            args = argparse.Namespace(arxiv_id=f"{TEST_ID}v5")
+            arxiv_tool.cmd_info(args)
+
+        out = capsys.readouterr().out
+        assert f"Tex (cached): {cached}" in out
+
 
 class TestCmdBib:
     """cmd_bib CLI 行为"""

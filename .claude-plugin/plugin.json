@@ -1,6 +1,6 @@
 {
   "name": "arxiv-tools",
-  "version": "1.4.4",
+  "version": "1.4.5",
   "description": "Search papers across multiple sources, download full text (LaTeX/PDF), generate BibTeX entries, and look up who cited a paper.",
   "author": { "name": "WhymustIhaveaname" },
   "license": "MIT",
