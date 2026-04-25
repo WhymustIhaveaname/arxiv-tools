@@ -506,6 +506,13 @@ def _s2_filters_from_args(args) -> dict:
 
 def cmd_search(args):
     source = args.source
+    if source == "openalex" and not OPENALEX_ENABLED:
+        print(
+            "OpenAlex 源已被禁用 (上游 metadata 污染). "
+            "请改用 --source s2 / --source arxiv, 或省略 --source 走自动选择.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     filters = _s2_filters_from_args(args)
 
     results = None
@@ -1226,6 +1233,13 @@ def _print_citations_openalex(results: list[dict], start: int = 1) -> None:
 def cmd_cited(args):
     clean_id = extract_arxiv_id(args.arxiv_id)
     source = args.source
+    if source == "openalex" and not OPENALEX_ENABLED:
+        print(
+            "OpenAlex 源已被禁用 (上游 metadata 污染). "
+            "请改用 --source s2, 或省略 --source 走自动选择.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     offset = args.offset
     results = None
     used_source = ""
@@ -1397,6 +1411,9 @@ def main():
         args.func(args)
     except KeyboardInterrupt:
         _exit_code = 130
+    except SystemExit as e:
+        # cmd_* 内部 sys.exit(N) 不算异常, 但要把退出码捕获进 audit; 否则 audit 记 0 与实际 N 不符.
+        _exit_code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
     except arxiv.HTTPError as e:
         # arxiv.HTTPError.__str__ 带完整 URL，只取 HTTP 状态码
         print(f"Error: arXiv HTTP {e.status}", file=sys.stderr)

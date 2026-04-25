@@ -679,7 +679,11 @@ class TestCmdBib:
 
     def test_stdout_output(self, capsys):
         """无 -o 时输出到 stdout"""
-        with patch("arxiv_tool.get_paper_info", return_value=MOCK_PAPER):
+        # cmd_bib 会先读 get_cached_bibtex, 不 mock 会被本地 SQLite cache 污染 (eg S2 返回的小写
+        # 版本 "Attention is All you Need" 覆盖 MOCK_PAPER 的 canonical 大写). Mock 成 None
+        # 强制走 generate_bibtex(MOCK_PAPER, ...) 路径.
+        with patch("arxiv_tool.get_paper_info", return_value=MOCK_PAPER), \
+             patch("arxiv_tool.get_cached_bibtex", return_value=None):
             args = argparse.Namespace(arxiv_id=TEST_ID, output=None)
             arxiv_tool.cmd_bib(args)
 
@@ -1136,7 +1140,10 @@ class TestGetPaperInfo:
     """get_paper_info 集成测试"""
 
     def test_title(self, paper_info):
-        assert TEST_TITLE in paper_info.title
+        # 大小写不敏感: arXiv 官方 "Attention Is All You Need", S2 返回 "Attention is All you Need".
+        # fetcher 链 S2 优先于 arXiv, 所以本地实际拿到的可能是任一版本. 测试意图是 "拿对论文",
+        # 上游 title casing 不在测试 contract 内.
+        assert TEST_TITLE.lower() in paper_info.title.lower()
 
     def test_first_author(self, paper_info):
         first = paper_info.authors[0].name.lower()
@@ -1306,7 +1313,8 @@ class TestBibIntegration:
     def test_real_bibtex(self, paper_info):
         bib = arxiv_tool.generate_bibtex(paper_info, TEST_ID)
         assert "@misc{vaswani2017attention," in bib
-        assert "Attention Is All You Need" in bib
+        # S2 返回 "is/you" 小写, arXiv 返回 "Is/You" 大写; 都接受
+        assert "Attention Is All You Need".lower() in bib.lower()
 
 
 @network
