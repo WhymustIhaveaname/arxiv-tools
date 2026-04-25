@@ -1,5 +1,5 @@
 ---
-name: literature
+name: arxiv
 description: >
   Use this skill whenever the user needs to work with academic papers across
   ANY field — computer science, AI/ML, physics, math, chemistry, biology,

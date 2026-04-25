@@ -112,5 +112,5 @@ uv run -m pytest tests/ -v -m "not network" # 跳过网络
 
 ## 详细文档
 
-- 用户手册 (slash command): `skills/literature/SKILL.md`
+- 用户手册 (slash command): `skills/arxiv/SKILL.md`
 - 开发笔记 (架构、API 详情、踩过的坑、待做): `~/notes/universal-literature-tool-plan.md`
