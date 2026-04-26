@@ -54,6 +54,7 @@ autodetects.
 | Biomedical similar papers | `similar <pmid>` |
 | Text-mined genes / diseases / chemicals in a paper | `annotations <id>` |
 | arXiv LaTeX source only | `tex <arxiv-id>` |
+| Metadata plus arXiv LaTeX source | `infotex <arxiv-id>` |
 | Paper full text onto disk (any ID type) | `fulltext <id>` |
 | Bulk fulltext over a list of IDs | `fulltext-batch <ids.txt>` |
 | Audit a doc: fetch every paper id it cites | `fulltext-sweep <file.md> [...]` |
@@ -100,6 +101,10 @@ CF-locked — so unreachable papers never surface to the user.
 a paper exists at the ID the user gave, checking year / authors for a
 bibliography. Upgrade to `fulltext` the moment you decide to cite.
 
+For arXiv-only triage where you also want the local source path, use
+`infotex <arxiv-id>`: it runs `info` then `tex`, and `info` prints
+`Tex (cached): ...` when source is already on disk.
+
 When a doc is finished and you want one safety sweep, run
 `fulltext-sweep <doc>` — it scans the file for arxiv / DOI / PMC ids, dedupes,
 and batches them through the same pipeline as `fulltext-batch`. Cached refs
@@ -137,8 +142,8 @@ For every paper the user asks you to fetch, in order:
 ## Playwright MCP recipe — run this when automatic fetch fails
 
 <recipe>
-The tool has already tried open-access mirrors (Unpaywall / OpenAlex
-`best_oa_location` / CORE / Crossref TDM), Europe PMC cross-references,
+The tool has already tried open-access mirrors (Unpaywall / CORE / Crossref
+TDM, plus any cached OpenAlex `best_oa_location` URL), Europe PMC cross-references,
 preprint reverse-lookup, and direct publisher fetch. Remaining failure modes
 are Cloudflare challenges, publisher paywalls, and JS-required download
 buttons. Playwright MCP bypasses all three.
@@ -248,6 +253,15 @@ Agent actions:
 Do not open a browser when the automatic chain already succeeded. The recipe
 is only for the handoff case.
 </recipe>
+
+## OpenAlex Status
+
+<openalex>
+OpenAlex network calls are currently disabled by default because upstream
+metadata contamination was observed on some arXiv records. Do not force
+`--source openalex`; the CLI will exit with a clear disabled-source message.
+Use default multi-source search/info or explicit `--source s2` / `--source arxiv`.
+</openalex>
 
 ## Piggyback metadata while the browser is open
 

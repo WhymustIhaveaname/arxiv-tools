@@ -994,7 +994,8 @@ class TestEnrichPolicy:
             pmid="123", pmcid="PMC9", doi="junk", year=9999, arxiv_id="junk",
         )
         paper = CachedPaper(title="X", authors=[CachedAuthor("A")], doi="10.x/y")
-        with patch("lit.enrich._fetch_paper_openalex_spec", return_value=enriched):
+        with patch("lit.enrich.OPENALEX_ENABLED", True), \
+             patch("lit.enrich._fetch_paper_openalex_spec", return_value=enriched):
             enrich_paper_ids(paper)
         assert paper.pmid == "123"
         assert paper.pmcid == "PMC9"
@@ -1009,7 +1010,8 @@ class TestEnrichPolicy:
             title="X", authors=[CachedAuthor("A")],
             doi="10.real/paper", year=2017, arxiv_id="1706.03762",
         )
-        with patch("lit.enrich._fetch_paper_openalex_spec", return_value=enriched):
+        with patch("lit.enrich.OPENALEX_ENABLED", True), \
+             patch("lit.enrich._fetch_paper_openalex_spec", return_value=enriched):
             enrich_paper_ids(paper)
         assert paper.doi == "10.real/paper"
         assert paper.year == 2017
@@ -1022,6 +1024,15 @@ class TestEnrichPolicy:
         with patch("lit.enrich._fetch_paper_openalex_spec") as mock_oa:
             enrich_paper_ids(paper)
             mock_oa.assert_not_called()
+
+    def test_openalex_disabled_short_circuits(self):
+        from lit.enrich import enrich_paper_ids
+        paper = CachedPaper(title="X", authors=[CachedAuthor("A")], doi="10.x/y")
+        with patch("lit.enrich.OPENALEX_ENABLED", False), \
+             patch("lit.enrich._fetch_paper_openalex_spec") as mock_oa:
+            enrich_paper_ids(paper)
+            mock_oa.assert_not_called()
+        assert paper.pmid is None
 
 
 class TestCrossrefCacheRows:
@@ -1438,6 +1449,17 @@ class TestCmdInfo:
         assert "cs.CL" in out
         assert "dominant sequence transduction" in out
 
+    def test_output_includes_cached_tex_path(self, tmp_path, capsys, cache_db):
+        tex_dir = tmp_path / f"{TEST_ID}_Attention_Is_All_You_Need"
+        tex_dir.mkdir()
+        with patch("arxiv_tool.OUTPUT_DIR", tmp_path), \
+             patch("arxiv_tool.aggregate_lookup", return_value=MOCK_PAPER):
+            args = argparse.Namespace(arxiv_id=TEST_ID)
+            arxiv_tool.cmd_info(args)
+
+        out = capsys.readouterr().out
+        assert f"Tex (cached): {tex_dir}" in out
+
     def test_not_found_no_output(self, capsys, cache_db):
         """论文未找到时不输出论文信息"""
         with patch("arxiv_tool.aggregate_lookup", return_value=None):
@@ -1558,6 +1580,16 @@ class TestCmdTex:
             mock_fallback.assert_called_once()
 
 
+class TestCmdInfotex:
+    def test_runs_info_then_tex(self):
+        args = argparse.Namespace(arxiv_id=TEST_ID)
+        with patch("arxiv_tool.cmd_info") as mock_info, \
+             patch("arxiv_tool.cmd_tex") as mock_tex:
+            arxiv_tool.cmd_infotex(args)
+            mock_info.assert_called_once_with(args)
+            mock_tex.assert_called_once_with(args)
+
+
 class TestCmdCited:
     """cmd_cited 命令行为：数据源选择与回退"""
 
@@ -1582,23 +1614,24 @@ class TestCmdCited:
         assert "Semantic Scholar" in out
         assert "Paper A" in out
 
-    def test_openalex_forced(self, capsys):
-        """--source openalex 只调 OpenAlex"""
-        fake_results = [{"title": "Paper X", "authorships": [], "cited_by_count": 10, "publication_year": 2020}]
+    def test_openalex_forced_disabled(self, capsys):
+        """--source openalex exits clearly while OpenAlex is disabled."""
         with patch("arxiv_tool._fetch_citations_s2_spec") as mock_s2, \
-             patch("arxiv_tool._fetch_citations_openalex_spec", return_value=(fake_results, 50)) as mock_oa:
-            arxiv_tool.cmd_cited(self._make_args(source="openalex"))
+             patch("arxiv_tool._fetch_citations_openalex_spec") as mock_oa:
+            with pytest.raises(SystemExit) as exc:
+                arxiv_tool.cmd_cited(self._make_args(source="openalex"))
+            assert exc.value.code == 2
             mock_s2.assert_not_called()
-            mock_oa.assert_called_once()
+            mock_oa.assert_not_called()
 
-        out = capsys.readouterr().out
-        assert "OpenAlex" in out
-        assert "Paper X" in out
+        err = capsys.readouterr().err
+        assert "OpenAlex 源已被禁用" in err
 
     def test_auto_fallback_s2_to_openalex(self, capsys):
         """auto 模式: S2 失败后回退到 OpenAlex"""
         fake_results = [{"title": "Fallback Paper", "authorships": [], "cited_by_count": 5, "publication_year": 2021}]
-        with patch("arxiv_tool._fetch_citations_s2_spec", return_value=None) as mock_s2, \
+        with patch("arxiv_tool.OPENALEX_ENABLED", True), \
+             patch("arxiv_tool._fetch_citations_s2_spec", return_value=None) as mock_s2, \
              patch("arxiv_tool._fetch_citations_openalex_spec", return_value=(fake_results, 30)) as mock_oa:
             arxiv_tool.cmd_cited(self._make_args(source="auto"))
             mock_s2.assert_called_once()
@@ -1649,7 +1682,8 @@ class TestCmdCited:
     def test_pmid_falls_back_to_openalex_with_pmid_spec(self):
         fake_results = [{"title": "P", "authorships": [], "cited_by_count": 0, "publication_year": 2024}]
         args = argparse.Namespace(arxiv_id="39876543", source="auto", max=5, offset=0)
-        with patch("arxiv_tool._fetch_citations_s2_spec", return_value=None), \
+        with patch("arxiv_tool.OPENALEX_ENABLED", True), \
+             patch("arxiv_tool._fetch_citations_s2_spec", return_value=None), \
              patch("arxiv_tool._fetch_citations_openalex_spec", return_value=(fake_results, 30)) as mock_oa:
             arxiv_tool.cmd_cited(args)
             mock_oa.assert_called_once_with("PMID:39876543", 5, 0)
@@ -1764,6 +1798,14 @@ class TestGenerateBibtexPubmed:
 
 class TestCmdSearch:
     """cmd_search CLI 行为"""
+
+    def test_openalex_source_disabled(self, capsys):
+        args = argparse.Namespace(query="test", max=5, source="openalex")
+        with pytest.raises(SystemExit) as exc:
+            arxiv_tool.cmd_search(args)
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "OpenAlex 源已被禁用" in err
 
     def test_no_results(self, capsys):
         """所有源都无结果时输出提示"""
@@ -2083,6 +2125,7 @@ class TestGetPaperInfo:
 class TestFetchPaperSources:
     """三个数据源的独立测试 + 一致性验证"""
 
+    @pytest.mark.skipif(not arxiv_tool.OPENALEX_ENABLED, reason="OpenAlex disabled")
     def test_openalex_returns_paper(self):
         result = arxiv_tool._fetch_paper_openalex(TEST_ID)
         assert result is not None
@@ -2101,6 +2144,7 @@ class TestFetchPaperSources:
         assert TEST_TITLE in result.title
         assert result.categories  # 只有 arXiv 源有 categories
 
+    @pytest.mark.skipif(not arxiv_tool.OPENALEX_ENABLED, reason="OpenAlex disabled")
     def test_sources_consistent(self):
         """三个源返回的 title 和第一作者应一致"""
         oa = arxiv_tool._fetch_paper_openalex(TEST_ID)
@@ -2115,6 +2159,7 @@ class TestFetchPaperSources:
         assert oa.authors[0].name == ar.authors[0].name
         assert s2.authors[0].name == ar.authors[0].name
 
+    @pytest.mark.skipif(not arxiv_tool.OPENALEX_ENABLED, reason="OpenAlex disabled")
     def test_bibtex_year_from_arxiv_id(self):
         """无论哪个源，BibTeX year 都应从 arXiv ID 提取"""
         oa = arxiv_tool._fetch_paper_openalex(TEST_ID)
@@ -2244,7 +2289,7 @@ class TestCitedSemanticScholar:
 
     def test_citations_and_max_results(self):
         """基本查询 + max_results 限制"""
-        ret = arxiv_tool._fetch_citations_s2_spec(TEST_ID, max_results=3)
+        ret = arxiv_tool._fetch_citations_s2_spec(f"ArXiv:{TEST_ID}", max_results=3)
         assert ret is not None, "S2 返回 None（可能被限流）"
         results, total = ret
         assert total > 0
@@ -2254,12 +2299,12 @@ class TestCitedSemanticScholar:
 
     def test_offset(self):
         """offset 翻页返回不同结果"""
-        ret = arxiv_tool._fetch_citations_s2_spec(TEST_ID, max_results=3, offset=0)
+        ret = arxiv_tool._fetch_citations_s2_spec(f"ArXiv:{TEST_ID}", max_results=3, offset=0)
         assert ret is not None, "S2 返回 None（可能被限流）"
         titles_page1 = {p.get("title") for p in ret[0]}
 
         time.sleep(1)
-        ret = arxiv_tool._fetch_citations_s2_spec(TEST_ID, max_results=3, offset=5)
+        ret = arxiv_tool._fetch_citations_s2_spec(f"ArXiv:{TEST_ID}", max_results=3, offset=5)
         assert ret is not None, "S2 返回 None（可能被限流）"
         titles_page2 = {p.get("title") for p in ret[0]}
 
@@ -2267,6 +2312,7 @@ class TestCitedSemanticScholar:
 
 
 @network
+@pytest.mark.skipif(not arxiv_tool.OPENALEX_ENABLED, reason="OpenAlex disabled")
 class TestCitedOpenAlex:
     """被引反查 - OpenAlex"""
 

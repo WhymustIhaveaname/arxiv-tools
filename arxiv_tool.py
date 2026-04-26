@@ -16,6 +16,7 @@ Subcommands:
     info   - fetch paper metadata (no download)
     bib    - generate a BibTeX entry
     tex    - download LaTeX source (with PDF-text fallback)
+    infotex - print info, then download/show LaTeX source
     cited  - reverse citation lookup (S2 → OpenAlex)
 
 Usage (via uv run):
@@ -23,6 +24,7 @@ Usage (via uv run):
     uv run arxiv_tool.py info 2401.12345
     uv run arxiv_tool.py bib 2401.12345 -o refs.bib
     uv run arxiv_tool.py tex 2401.12345
+    uv run arxiv_tool.py infotex 2401.12345
     uv run arxiv_tool.py cited 1711.10561 --max 20
     uv run arxiv_tool.py cited 1711.10561 --offset 20
     uv run arxiv_tool.py cited 1711.10561 --source openalex
@@ -35,20 +37,27 @@ existing tests that patch `arxiv_tool.X` working.
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import re
 import sys
+import time
 from collections.abc import Callable
+from datetime import datetime as _datetime
 from pathlib import Path
 
 import arxiv
 import requests
 
 from lit.config import (
+    AUDIT_LOG,
     CACHE_DIR,
     CONTACT_EMAIL,
     HTTP_HEADERS,
     MANUAL_PDF_DIR,
     OPENALEX_API_BASE,
     OPENALEX_API_KEY,
+    OPENALEX_ENABLED,
     S2_API_BASE,
     S2_API_KEY,
     WORK_DIR,
@@ -175,6 +184,24 @@ from paper_cache import (
 )
 
 OUTPUT_DIR = CACHE_DIR
+
+_LAST_SOURCE: str = "unknown"
+
+
+def _set_source(src: str) -> None:
+    """Record the main source used by the current CLI invocation for audit."""
+    global _LAST_SOURCE
+    _LAST_SOURCE = src
+
+
+def _write_audit_entry(entry: dict) -> None:
+    """Append a CLI audit row. Failures are deliberately non-fatal."""
+    try:
+        AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(AUDIT_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
 
 
 def get_paper_info(arxiv_id: str):
@@ -374,12 +401,21 @@ def _run_single_source(args, source: str) -> None:
         print(f"No results from {label}")
         return
     normalized = normalize_fn(raw)
+    _set_source(source)
     print(f"\nFound {len(normalized)} papers ({label}):\n")
     _print_search_results(normalized)
 
 
 def cmd_search(args):
     source = args.source
+    if source == "openalex" and not OPENALEX_ENABLED:
+        print(
+            "OpenAlex 源已被禁用 (上游 metadata 污染). "
+            "请改用 --source s2 / --source arxiv, 或省略 --source 走默认多源搜索.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     filters = _s2_filters_from_args(args)
 
     if source == "all":
@@ -405,6 +441,8 @@ def cmd_search(args):
                 f" + S2 fields_of_study={agg_filters.get('fields_of_study')!r}",
                 file=sys.stderr,
             )
+        if not OPENALEX_ENABLED and "openalex" in sources:
+            sources = [s for s in sources if s != "openalex"]
         print(
             f"Searching {', '.join(sources)} in parallel...",
             file=sys.stderr,
@@ -413,6 +451,7 @@ def cmd_search(args):
         if not hits:
             print("No results from any source")
             return
+        _set_source("all")
         print(f"\nFound {len(hits)} unique papers:\n")
         _print_aggregated_results(hits)
         return
@@ -440,7 +479,7 @@ def cmd_search(args):
             if raw:
                 results = ("Semantic Scholar", _normalize_s2_search(raw))
 
-    if not results and source in ("openalex", "auto"):
+    if not results and source in ("openalex", "auto") and OPENALEX_ENABLED:
         print("Searching OpenAlex...", file=sys.stderr)
         raw = _search_openalex(args.query, args.max)
         if raw:
@@ -448,11 +487,14 @@ def cmd_search(args):
 
     if not results and source in ("arxiv", "auto"):
         if source == "auto":
-            print(
-                "⚠ S2 and OpenAlex both failed, falling back to arXiv API. "
-                "If this keeps happening, check API keys and network.",
-                file=sys.stderr,
-            )
+            if OPENALEX_ENABLED:
+                msg = (
+                    "⚠ S2 and OpenAlex both failed, falling back to arXiv API. "
+                    "If this keeps happening, check API keys and network."
+                )
+            else:
+                msg = "⚠ S2 failed, falling back to arXiv API (OpenAlex disabled)."
+            print(msg, file=sys.stderr)
         print("Searching arXiv...", file=sys.stderr)
         raw = search_papers(args.query, args.max)
         if raw:
@@ -463,6 +505,7 @@ def cmd_search(args):
         return
 
     source_name, normalized = results
+    _set_source(source_name.split()[0].lower())
     print(f"\nFound {len(normalized)} papers ({source_name}):\n")
     _print_search_results(normalized)
 
@@ -537,6 +580,7 @@ def cmd_info(args):
         sys.exit(1)
 
     paper = get_cached_paper(cache_key)
+    was_cached = paper is not None
     if paper is None:
         kwargs = {id_type if id_type != "arxiv" else "arxiv_id": clean_id}
         paper = aggregate_lookup(**kwargs)
@@ -551,6 +595,8 @@ def cmd_info(args):
             cache_paper_with_crossrefs(cache_key, paper, "")
         except Exception as e:  # noqa: BLE001
             print(f"[cmd_info] cache write failed: {e}", file=sys.stderr)
+
+    _set_source("cache" if was_cached else (getattr(paper, "source", None) or "lookup"))
 
     if id_type == "pmid":
         print_pubmed_info(clean_id, paper)
@@ -569,6 +615,9 @@ def cmd_info(args):
     if paper.categories:
         print(f"Categories: {', '.join(paper.categories)}")
     print(f"PDF: {paper.pdf_url}")
+    cached_tex = _find_cached_tex_dir(clean_id)
+    if cached_tex:
+        print(f"Tex (cached): {cached_tex}")
     print(f"\nAbstract:\n{paper.abstract}")
 
 
@@ -674,6 +723,14 @@ def cmd_bib(args):
 def cmd_cited(args):
     paper_spec, display_id, _id_type, _clean_id = _resolve_xref_id(args.arxiv_id)
     source = args.source
+    if source == "openalex" and not OPENALEX_ENABLED:
+        print(
+            "OpenAlex 源已被禁用 (上游 metadata 污染). "
+            "请改用 --source s2, 或省略 --source 走自动选择.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     offset = args.offset
     results = None
     used_source = ""
@@ -685,7 +742,7 @@ def cmd_cited(args):
             results, _total = ret
             used_source = "Semantic Scholar"
 
-    if results is None and source in ("openalex", "auto"):
+    if results is None and source in ("openalex", "auto") and OPENALEX_ENABLED:
         if source == "auto":
             print("\nSemantic Scholar failed, switching to OpenAlex...")
         else:
@@ -701,6 +758,7 @@ def cmd_cited(args):
 
     start_num = offset + 1
     end_num = offset + len(results)
+    _set_source(used_source.split()[0].lower())
     print(f"\nSource: {used_source}")
     print(f"Showing citations #{start_num}-{end_num}:\n")
 
@@ -896,16 +954,39 @@ def cmd_similar(args):
 
 
 def cmd_tex(args):
+    was_cached = _find_cached_tex_dir(args.arxiv_id) is not None
     result = fetch_tex_source(args.arxiv_id, OUTPUT_DIR)
     if result:
+        _set_source("cache" if was_cached else "arxiv")
         print("\nDirectory structure:")
         print(result.name)
         tree_lines = print_tree(result)
         for line in tree_lines:
             print(line)
     else:
+        _set_source("pdf_fallback")
         print("\ntex download failed, falling back to PDF...", file=sys.stderr)
         _fetch_pdf_fallback(args.arxiv_id, OUTPUT_DIR)
+
+
+def _find_cached_tex_dir(arxiv_id: str) -> Path | None:
+    """Return an existing extracted tex directory without any network request."""
+    clean_id = re.sub(r"v\d+$", "", extract_arxiv_id(arxiv_id))
+    dir_id = basename_for_id("arxiv", clean_id)
+    exact = OUTPUT_DIR / dir_id
+    if exact.is_dir():
+        return exact
+    for path in OUTPUT_DIR.glob(f"{dir_id}_*"):
+        if path.is_dir():
+            return path
+    return None
+
+
+def cmd_infotex(args):
+    """Print metadata, then fetch/show the LaTeX source tree."""
+    cmd_info(args)
+    print()
+    cmd_tex(args)
 
 
 # Re-exported for back-compat with code that imports `arxiv_tool._extract_pdf_text`.
@@ -1454,6 +1535,7 @@ def main():
     %(prog)s bib 2505.08783
     %(prog)s bib 2505.08783 -o references.bib
     %(prog)s tex 2505.08783
+    %(prog)s infotex 2505.08783
     %(prog)s cited 1711.10561
     %(prog)s cited 1711.10561 --max 50
     %(prog)s cited 1711.10561 --offset 20          # 第 21-40 条
@@ -1568,6 +1650,12 @@ def main():
     tex_parser.add_argument("arxiv_id", help="arXiv ID")
     tex_parser.set_defaults(func=cmd_tex)
 
+    infotex_parser = subparsers.add_parser(
+        "infotex", help="info + tex 组合：先打印论文信息，再下载 LaTeX"
+    )
+    infotex_parser.add_argument("arxiv_id", help="arXiv ID")
+    infotex_parser.set_defaults(func=cmd_infotex)
+
     fulltext_parser = subparsers.add_parser(
         "fulltext", help="下载全文: 分层 fallback (JATS→BioC→PDF; OA mirror; Playwright)"
     )
@@ -1630,16 +1718,52 @@ def main():
     import_parser.set_defaults(func=cmd_fulltext_import)
 
     args = parser.parse_args()
+    started = time.time()
+    exit_code = 0
+    global _LAST_SOURCE
+    _LAST_SOURCE = "unknown"
+    arg = (
+        getattr(args, "arxiv_id", None)
+        or getattr(args, "query", None)
+        or getattr(args, "ids_file", None)
+        or getattr(args, "pdf_dir", None)
+        or ""
+    )
+    if not arg and getattr(args, "files", None):
+        arg = ",".join(str(p) for p in args.files)
+    flags = {
+        k: v for k, v in vars(args).items()
+        if k not in ("command", "func", "arxiv_id", "query", "ids_file", "files", "pdf_dir")
+        and v is not None and v is not False
+    }
+
     try:
         args.func(args)
+    except SystemExit as e:
+        exit_code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
     except KeyboardInterrupt:
-        sys.exit(130)
+        exit_code = 130
     except arxiv.HTTPError as e:
         print(f"Error: arXiv HTTP {e.status}", file=sys.stderr)
-        sys.exit(1)
+        exit_code = 1
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        exit_code = 1
+    finally:
+        _write_audit_entry({
+            "ts": _datetime.now().isoformat(timespec="seconds"),
+            "user": os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown",
+            "cmd": args.command,
+            "arg": arg,
+            "flags": flags,
+            "source_hit": _LAST_SOURCE,
+            "cached_before": _LAST_SOURCE == "cache",
+            "elapsed_s": round(time.time() - started, 3),
+            "exit_code": exit_code,
+        })
+
+    if exit_code:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

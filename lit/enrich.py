@@ -14,6 +14,7 @@ Subsequent cache hits pay nothing.
 
 from __future__ import annotations
 
+from lit.config import OPENALEX_ENABLED
 from lit.sources.openalex import _fetch_paper_openalex_spec
 from paper_cache import CachedPaper
 
@@ -44,6 +45,9 @@ def enrich_paper_ids(paper: CachedPaper) -> CachedPaper:
     unconditionally: short-circuits when both PMID and PMCID are already
     populated, fails silently if OpenAlex has no matching record.
     """
+    if not OPENALEX_ENABLED:
+        return paper
+
     if paper.pmid and paper.pmcid:
         return paper
 

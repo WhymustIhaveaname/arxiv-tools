@@ -17,6 +17,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
+from lit.config import OPENALEX_ENABLED
 from lit.ids import _arxiv_year
 from lit.sources.arxiv_api import _fetch_paper_arxiv, search_papers as _search_arxiv
 from lit.sources.chemrxiv import (
@@ -40,7 +41,9 @@ from paper_cache import CachedPaper
 
 
 ALL_SOURCES = ("openalex", "s2", "pubmed", "europepmc", "chemrxiv", "arxiv")
-DEFAULT_SOURCES = ALL_SOURCES  # 用户要求"尽量强大": 默认全开
+DEFAULT_SOURCES = (
+    ALL_SOURCES if OPENALEX_ENABLED else tuple(s for s in ALL_SOURCES if s != "openalex")
+)
 
 SOURCE_SHORT = {
     "openalex": "OA",
@@ -639,17 +642,20 @@ def aggregate_lookup(
     """
     fetchers: list[tuple[str, callable]] = []
     if arxiv_id:
-        fetchers.append(("openalex", lambda: _fetch_paper_openalex(arxiv_id)))
+        if OPENALEX_ENABLED:
+            fetchers.append(("openalex", lambda: _fetch_paper_openalex(arxiv_id)))
         fetchers.append(("s2",       lambda: _fetch_paper_s2(arxiv_id)))
         fetchers.append(("arxiv",    lambda: _fetch_paper_arxiv(arxiv_id)))
     if doi:
-        fetchers.append(("openalex", lambda: _fetch_paper_openalex_spec(f"DOI:{doi}")))
+        if OPENALEX_ENABLED:
+            fetchers.append(("openalex", lambda: _fetch_paper_openalex_spec(f"DOI:{doi}")))
         fetchers.append(("europepmc", lambda: _fetch_paper_europepmc_by_doi(doi)))
         if is_chemrxiv_doi(doi):
             fetchers.append(("chemrxiv", lambda: _fetch_paper_chemrxiv(doi)))
     if pmid:
         fetchers.append(("pubmed",   lambda: _fetch_paper_pubmed(pmid)))
-        fetchers.append(("openalex", lambda: _fetch_paper_openalex_spec(f"PMID:{pmid}")))
+        if OPENALEX_ENABLED:
+            fetchers.append(("openalex", lambda: _fetch_paper_openalex_spec(f"PMID:{pmid}")))
 
     if not fetchers:
         return None

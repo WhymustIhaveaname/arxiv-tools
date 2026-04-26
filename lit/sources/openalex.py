@@ -8,7 +8,12 @@ import requests
 
 import re
 
-from lit.config import CONTACT_EMAIL, OPENALEX_API_BASE, OPENALEX_API_KEY
+from lit.config import (
+    CONTACT_EMAIL,
+    OPENALEX_API_BASE,
+    OPENALEX_API_KEY,
+    OPENALEX_ENABLED,
+)
 from lit.ids import _truncate_authors
 from lit.ratelimit import _brief_error, _request_with_retry
 from paper_cache import CachedAuthor, CachedPaper
@@ -38,6 +43,9 @@ def _reconstruct_abstract(inverted_index: dict | None) -> str | None:
 
 
 def _search_openalex(query: str, max_results: int = 10) -> list[dict] | None:
+    if not OPENALEX_ENABLED:
+        return None
+
     url = f"{OPENALEX_API_BASE}/works"
     try:
         resp = _request_with_retry(
@@ -79,6 +87,9 @@ def _fetch_paper_openalex_spec(paper_spec: str) -> CachedPaper | None:
     Returns a CachedPaper with title/authors/abstract/year and any
     cross-reference IDs OpenAlex returns. ``source`` is set to "openalex".
     """
+    if not OPENALEX_ENABLED:
+        return None
+
     url = _openalex_url_for_spec(paper_spec)
     if url is None:
         return None
@@ -180,6 +191,9 @@ def _resolve_openalex_id_spec(paper_spec: str) -> tuple[str, str, int] | None:
     Accepts ``"ArXiv:xxx"`` (mapped via 10.48550/arXiv.xxx DOI), ``"PMID:xxx"``
     (OpenAlex's native pmid: accessor), or ``"DOI:xxx"``.
     """
+    if not OPENALEX_ENABLED:
+        return None
+
     if paper_spec.startswith("ArXiv:"):
         doi = f"10.48550/arXiv.{paper_spec[len('ArXiv:'):]}"
         url = f"{OPENALEX_API_BASE}/works/doi:{doi}"
@@ -207,6 +221,9 @@ def _resolve_openalex_id(arxiv_id: str) -> tuple[str, str, int] | None:
 def _fetch_citations_openalex_spec(
     paper_spec: str, max_results: int, offset: int = 0
 ) -> tuple[list[dict], int] | None:
+    if not OPENALEX_ENABLED:
+        return None
+
     resolved = _resolve_openalex_id_spec(paper_spec)
     if not resolved:
         print("OpenAlex: paper not found", file=sys.stderr)

@@ -39,6 +39,14 @@ PUBMED_API_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 EUROPEPMC_API_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 CORE_API_BASE = "https://api.core.ac.uk/v3"
 
+# Feature flag: OpenAlex has had upstream metadata contamination for some
+# arXiv records. Keep the adapter code in place, but disable all OpenAlex
+# network calls by default until the source is trusted again.
+OPENALEX_ENABLED = False
+
+# One JSONL row per CLI invocation; audit failures must never affect the tool.
+AUDIT_LOG = CACHE_DIR / ".audit.jsonl"
+
 _mailto = f" (mailto:{CONTACT_EMAIL})" if CONTACT_EMAIL else ""
 HTTP_HEADERS = {
     "User-Agent": f"arxiv-tool/1.0{_mailto}",

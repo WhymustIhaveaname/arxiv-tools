@@ -14,8 +14,10 @@
 | `similar <PMID>` | 相似论文 (NCBI ELink `pubmed_pubmed`, 仅 PMID) |
 | `annotations <pmid\|pmcid>` | Europe PMC 文本挖掘实体 (基因/疾病/化学物质 + ontology URI) |
 | `tex <arxiv_id>` | arXiv LaTeX 源码 |
+| `infotex <arxiv_id>` | 先打印 `info`, 再跑 `tex`; `info` 若发现本地 tex cache 会显示路径 |
 | `fulltext <id>` | 分层全文获取链 (见下) |
 | `fulltext-batch <ids.txt>` | 批量跑 fulltext, 失败的写到 manifest TSV |
+| `fulltext-sweep <file.md> [...]` | 扫文档里的 arXiv/DOI/PMC ID, 批量补齐全文 |
 | `fulltext-import <dir>` | 扫目录导入手动下载的 PDF, 按 manifest/文件名匹配 |
 
 `<id>` 都自动识别: 接受 arXiv ID / PMID / PMC ID / DOI 任一形式。
@@ -27,6 +29,19 @@
 - `--year` / `--open-access` / `--min-citations` / `--venue` / `--fields-of-study` / `--pub-types`
 - `--max` / `--offset` (PubMed/EuropePMC 翻页)
 - `--bulk` / `--sort` / `--token` (S2 bulk 搜索, 最多 1000 条)
+
+### OpenAlex 状态
+
+OpenAlex adapter 代码保留, 但默认通过 `OPENALEX_ENABLED=False` 禁用网络调用:
+上游曾出现 arXiv 记录 metadata 污染。默认 `search --source all` 会跳过
+OpenAlex; 显式 `--source openalex` 会退出并提示改用 S2/arXiv。将来确认
+上游干净后只需在 `lit/config.py` 打开 flag。
+
+### Audit log
+
+每次 CLI 调用都会向 `$ARXIV_CACHE_DIR/.audit.jsonl` 追加一行 JSONL:
+`ts/user/cmd/arg/flags/source_hit/cached_before/elapsed_s/exit_code`。
+写 audit 失败会静默忽略, 不影响工具主流程。
 
 ### Fulltext 分层链
 
@@ -104,11 +119,11 @@ CONTACT_EMAIL=you@example.com # Crossref/Unpaywall polite pool 必需
 ## 测试
 
 ```bash
-uv run -m pytest tests/ -v                  # 全部 (含 @network)
-uv run -m pytest tests/ -v -m "not network" # 跳过网络
+uv run --with-requirements requirements-dev.txt -m pytest tests/ -v
+uv run --with-requirements requirements-dev.txt -m pytest tests/ -v -m "not network"
 ```
 
-318 个非网络测试。
+当前验证: 212 个测试通过, 6 个 OpenAlex live tests 因默认禁用而 skip。
 
 ## 详细文档
 

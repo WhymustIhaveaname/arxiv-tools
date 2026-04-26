@@ -1,0 +1,17 @@
+# Dev/test dependencies for arxiv-tools.
+#
+# arxiv_tool.py declares its runtime deps via PEP 723 inline metadata
+# (only auto-installed by `uv run arxiv_tool.py ...`). Tests import the
+# module directly, so the same runtime deps must be available to pytest.
+# Keep this file in sync with the `dependencies` block at the top of
+# arxiv_tool.py.
+
+# runtime (must match PEP 723 block in arxiv_tool.py)
+arxiv
+json5
+pymupdf
+python-dotenv
+requests
+
+# test
+pytest
