@@ -86,20 +86,44 @@ def is_pdf_bytes(data: bytes | None) -> bool:
     return bool(data) and data[:4] == b"%PDF"
 
 
-def extract_pdf_text(pdf_bytes: bytes) -> str | None:
-    """Return PyMuPDF's plain-text rendering of ``pdf_bytes``, or ``None``.
+def extract_pdf_text(
+    pdf_bytes: bytes, *, ocr_fallback: bool = False
+) -> tuple[str | None, bool]:
+    """Return ``(text, from_ocr)`` for ``pdf_bytes``.
 
-    Returns ``None`` for both unparseable PDFs and PyMuPDF crashes; the
-    caller decides whether to keep the raw PDF anyway.
+    *from_ocr* is *True* when the hybrid OCR pipeline recovered the text
+    from an image-only / near-empty PDF (fewer than 500 non-whitespace
+    characters from direct PyMuPDF extraction).
+
+    When *ocr_fallback* is *True* and the direct text is empty or scant,
+    :func:`lit.ocr.ocr_scanned_pdf` is called transparently.
+
+    Returns ``(None, False)`` for unparseable PDFs when OCR is disabled
+    or also fails.
     """
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     except Exception:
-        return None
+        return None, False
     try:
-        return "\n".join(page.get_text().strip() for page in doc)
+        direct = "\n".join(page.get_text().strip() for page in doc)
     finally:
         doc.close()
+
+    # Shortcut: enough text → return immediately
+    if direct and len(direct.strip()) >= 500:
+        return direct, False
+
+    if not ocr_fallback:
+        return direct or None, False
+
+    # ── OCR fallback for image-only / near-empty PDFs ──────────────
+    from lit.ocr import ocr_scanned_pdf  # deferred import (heavy deps)
+
+    ocr_text = ocr_scanned_pdf(pdf_bytes)
+    if ocr_text and ocr_text.strip():
+        return ocr_text, True
+    return direct or None, False
 
 
 def save_pdf_and_text(
@@ -121,29 +145,32 @@ def save_pdf_and_text(
     pdf_path.write_bytes(pdf_bytes)
     print(f"Saved PDF: {pdf_path} ({len(pdf_bytes):,} bytes)")
 
-    text = extract_pdf_text(pdf_bytes)
+    # ── text extraction with OCR fallback ──────────────────────────
+    text, from_ocr = extract_pdf_text(pdf_bytes, ocr_fallback=True)
     if text is None:
-        print("PDF text extraction failed; raw PDF is still usable.", file=sys.stderr)
+        print(
+            "PDF text extraction failed (PyMuPDF + OCR); raw PDF is still usable.",
+            file=sys.stderr,
+        )
         return
 
-    # Image-only PDFs (e.g. "Microsoft: Print To PDF" or scanned old reviews)
-    # produce a multi-MB binary with no text layer; PyMuPDF returns a page
-    # count's worth of empty strings, which join into all-whitespace output.
-    # Flag the case so the user knows to re-source, but still write the
-    # (near-empty) .txt so the cache has a known-complete entry.
-    if len(pdf_bytes) > 100_000 and len(text.strip()) < 500:
+    if not text.strip():
         print(
-            f"Warning: {out_basename} looks scanned/image-only "
-            f"({len(pdf_bytes):,}B PDF → only {len(text.strip())} text chars). "
-            f"Downstream LLM consumers will not see the content. Consider "
-            f"re-downloading from a source with an embedded text layer.",
+            f"Warning: {out_basename} has no extractable text "
+            f"({len(pdf_bytes):,}B PDF). "
+            f"Downstream LLM consumers will not see the content. "
+            f"Consider re-downloading from a source with an embedded text layer.",
             file=sys.stderr,
         )
 
     header = f"# {out_basename}\n"
     if source_url:
         header += f"\nURL: {source_url}\n"
-    txt_path.write_text(f"{header}\n## Full Text\n\n{text}", encoding="utf-8")
+
+    ocr_tag = " [OCR]" if from_ocr else ""
+    txt_path.write_text(
+        f"{header}\n## Full Text{ocr_tag}\n\n{text}", encoding="utf-8"
+    )
     print(f"Saved text: {txt_path} ({len(text):,} chars)")
 
 

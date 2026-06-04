@@ -5,6 +5,8 @@
 #     "arxiv",
 #     "json5",
 #     "pymupdf",
+#     "pytesseract",
+#     "pillow",
 #     "python-dotenv",
 #     "requests",
 # ]
@@ -990,6 +992,7 @@ def cmd_infotex(args):
 
 
 # Re-exported for back-compat with code that imports `arxiv_tool._extract_pdf_text`.
+# Note: returns (text, from_ocr) tuple since OCR fallback was added.
 _extract_pdf_text = _pdf_extract_text
 
 

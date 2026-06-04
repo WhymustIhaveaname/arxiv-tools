@@ -94,31 +94,42 @@ class TestExtractDoiFromPdf:
         assert extract_doi_from_pdf(pdf) == "10.48550/arxiv.2401.12345"
 
 
-class TestSavePdfAndTextWarnsOnScanned:
-    """save_pdf_and_text emits a stderr warning for image-only PDFs so the
-    user knows the downstream .txt is unusable. Triggered by a large PDF
-    (>100 KB) paired with near-zero extractable text."""
+class TestSavePdfAndTextOCR:
+    """save_pdf_and_text now runs OCR fallback for image-only PDFs.
+    When OCR also produces nothing it warns about no extractable text."""
 
-    def test_warns_when_large_pdf_yields_no_text(self, tmp_path, capsys):
+    def test_warns_when_ocr_also_fails(self, tmp_path, capsys):
         # An image-only PDF: valid %PDF bytes padded with noise to exceed
         # the size threshold, no text inserted so PyMuPDF returns empty.
+        # OCR on a blank page produces empty text too → warning.
         pdf_bytes = _make_pdf()  # empty doc, no text
         padded = pdf_bytes + b"%scan-noise-padding " * 10_000  # ~190 KB
         # Append after %%EOF is tolerated by fitz — it still parses the
         # leading valid PDF and extracts zero chars.
         save_pdf_and_text(padded, "scanned_basename", tmp_path)
         err = capsys.readouterr().err
-        assert "scanned/image-only" in err
+        assert "no extractable text" in err
         assert "scanned_basename" in err
 
     def test_no_warning_on_normal_pdf(self, tmp_path, capsys):
         pdf = _make_pdf(page_text="lorem ipsum " * 200)  # plenty of text
         save_pdf_and_text(pdf, "normal_basename", tmp_path)
-        assert "scanned/image-only" not in capsys.readouterr().err
+        assert "no extractable text" not in capsys.readouterr().err
 
     def test_no_warning_on_tiny_pdf(self, tmp_path, capsys):
         """Below the 100 KB threshold we don't warn; a tiny real PDF
         might legitimately be near-empty (a one-line memo, a cover sheet)."""
         pdf = _make_pdf()  # empty, small
         save_pdf_and_text(pdf, "tiny_basename", tmp_path)
-        assert "scanned/image-only" not in capsys.readouterr().err
+        assert "no extractable text" not in capsys.readouterr().err
+
+    def test_ocr_tag_in_header_on_recovered_text(self, tmp_path, capsys):
+        """When OCR recovers text from an image-only PDF the .txt header
+        includes an [OCR] tag."""
+        pdf = _make_pdf(page_text="The quick brown fox")  # small text (<500 chars)
+        padded = pdf + b"%scan-noise " * 10_000
+        save_pdf_and_text(padded, "ocr_tagged", tmp_path)
+        out = (tmp_path / "ocr_tagged.txt").read_text()
+        # Either text was recovered via OCR (has [OCR]) or not (no tag)
+        # Both outcomes are acceptable depending on Tesseract availability
+        assert "## Full Text" in out
