@@ -1425,3 +1425,86 @@ class TestCitedOpenAlex:
         assert ret is not None
         results, _ = ret
         assert len(results) <= 3
+
+
+def _make_tar_gz(files: dict[str, bytes]) -> bytes:
+    """构造 tar.gz 字节流 (standalone helper)"""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, content in files.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+class TestTexCacheArchive:
+    """tex TTL 过期时归档旧目录, 重新下载"""
+
+    def test_find_cached_skips_archived_dir(self, tmp_path, monkeypatch):
+        """_find_cached_tex_dir 应跳过 __YYMMDD 归档目录"""
+        monkeypatch.setattr(arxiv_tool, "OUTPUT_DIR", tmp_path)
+        archived = tmp_path / f"{TEST_ID}_Attention__250101"
+        archived.mkdir()
+        assert arxiv_tool._find_cached_tex_dir(TEST_ID) is None
+
+    def test_find_cached_prefers_current_over_archived(self, tmp_path, monkeypatch):
+        """同时存在归档和当前目录时, 返回当前目录"""
+        monkeypatch.setattr(arxiv_tool, "OUTPUT_DIR", tmp_path)
+        archived = tmp_path / f"{TEST_ID}_Attention__250101"
+        archived.mkdir()
+        current = tmp_path / f"{TEST_ID}_Attention_v2"
+        current.mkdir()
+        result = arxiv_tool._find_cached_tex_dir(TEST_ID)
+        assert result == current
+
+    def test_find_cached_ignores_non_date_suffix(self, tmp_path, monkeypatch):
+        """目录名以非日期的6位数结尾不应被误判为归档"""
+        monkeypatch.setattr(arxiv_tool, "OUTPUT_DIR", tmp_path)
+        legit = tmp_path / f"{TEST_ID}_Method__999999"
+        legit.mkdir()
+        # 999999 不是合法日期, 不应被过滤
+        assert arxiv_tool._find_cached_tex_dir(TEST_ID) == legit
+
+    def test_fetch_tex_archives_stale_dir(self, tmp_path, monkeypatch):
+        """TTL 过期的 tex 目录应被 rename 为 __YYMMDD 后重新下载"""
+        monkeypatch.setattr(arxiv_tool, "OUTPUT_DIR", tmp_path)
+        old_dir = tmp_path / f"{TEST_ID}_Old_Title"
+        old_dir.mkdir()
+        (old_dir / "main.tex").write_text("old content")
+        # 把 mtime 倒拨 8 天
+        import os
+        from datetime import timedelta
+        old_time = (datetime.now() - timedelta(days=8)).timestamp()
+        os.utime(old_dir, (old_time, old_time))
+
+        fake_content = _make_tar_gz({"main.tex": b"new content"})
+        mock_resp = type("R", (), {"content": fake_content, "status_code": 200})()
+
+        with patch("arxiv_tool._request_with_retry", return_value=mock_resp):
+            result = arxiv_tool.fetch_tex_source(TEST_ID, tmp_path)
+
+        assert result is not None
+        # 新目录有新内容
+        new_tex = list(result.glob("*.tex"))
+        assert any("new content" in f.read_text() for f in new_tex)
+        # 旧目录被归档 (带 __YYMMDD 后缀)
+        archived = [p for p in tmp_path.iterdir()
+                    if p.is_dir() and "__" in p.name and p != result]
+        assert len(archived) == 1
+        assert "old content" in (archived[0] / "main.tex").read_text()
+
+    def test_fetch_tex_no_archive_when_fresh(self, tmp_path, monkeypatch):
+        """TTL 内的目录不触发归档, 直接返回"""
+        monkeypatch.setattr(arxiv_tool, "OUTPUT_DIR", tmp_path)
+        fresh_dir = tmp_path / TEST_ID
+        fresh_dir.mkdir()
+        (fresh_dir / "main.tex").write_text("content")
+        # mtime 默认是 now, 在 TTL 内
+
+        result = arxiv_tool.fetch_tex_source(TEST_ID, tmp_path)
+        assert result == fresh_dir
+        # 没有归档目录
+        archived = [p for p in tmp_path.iterdir()
+                    if p.is_dir() and "__" in p.name]
+        assert len(archived) == 0

@@ -18,7 +18,8 @@ arXiv 论文搜索与全文获取工具
 3. bib - 生成 BibTeX 引用（自动生成 citation key）
 4. tex - 下载 LaTeX 源文件并解压（失败时自动 fallback 到 PDF 下载）
 5. cited - 被引反查（Semantic Scholar 首选，OpenAlex 备选）
-6. infotex - info + tex 组合：先打印论文信息，再下载 LaTeX
+6. references - 正引查询：查看该论文引用了哪些论文（Semantic Scholar）
+7. infotex - info + tex 组合：先打印论文信息，再下载 LaTeX
 
 使用方法（通过 uv run）：
     uv run arxiv_tool.py search "PINN" --max 5
@@ -29,6 +30,7 @@ arXiv 论文搜索与全文获取工具
     uv run arxiv_tool.py cited 1711.10561 --max 20
     uv run arxiv_tool.py cited 1711.10561 --offset 20  # 翻页
     uv run arxiv_tool.py cited 1711.10561 --source openalex
+    uv run arxiv_tool.py references 1711.10561 --max 20
 """
 
 from __future__ import annotations
@@ -51,9 +53,11 @@ import json5
 import requests
 from dotenv import load_dotenv
 
+from datetime import date as _date
 from datetime import datetime as _datetime
+from datetime import timedelta as _timedelta
 
-from paper_cache import CachedAuthor, CachedPaper, cache_paper, get_cached_bibtex, get_cached_paper
+from paper_cache import CACHE_TTL_DAYS, CachedAuthor, CachedPaper, cache_paper, get_cached_bibtex, get_cached_paper
 
 SCRIPT_DIR = Path(__file__).parent
 # 缓存目录：优先读 ARXIV_CACHE_DIR 环境变量，默认在脚本同目录下 .arxiv/
@@ -310,13 +314,14 @@ def _fetch_paper_arxiv(arxiv_id: str) -> CachedPaper | None:
     )
 
 
-def get_paper_info(arxiv_id: str) -> CachedPaper | None:
+def get_paper_info(arxiv_id: str, *, force_refresh: bool = False) -> CachedPaper | None:
     clean_id = extract_arxiv_id(arxiv_id)
 
-    cached = get_cached_paper(clean_id)
-    if cached:
-        _set_source("cache")
-        return cached
+    if not force_refresh:
+        cached = get_cached_paper(clean_id)
+        if cached:
+            _set_source("cache")
+            return cached
 
     paper = None
     for name, fetcher in (
@@ -603,8 +608,9 @@ def _fetch_pdf_fallback(arxiv_id: str, output_dir: Path) -> None:
 
 def cmd_info(args):
     clean_id = extract_arxiv_id(args.arxiv_id)
+    refresh = getattr(args, "refresh", False)
 
-    paper = get_paper_info(clean_id)
+    paper = get_paper_info(clean_id, force_refresh=refresh)
     if not paper:
         return
 
@@ -788,12 +794,24 @@ def print_tree(
     return lines
 
 
+def _is_archived_tex_dir(name: str) -> bool:
+    """名称以 __YYMMDD 结尾且为合法过去日期 → 归档目录"""
+    m = re.search(r"__(\d{6})$", name)
+    if not m:
+        return False
+    try:
+        d = _datetime.strptime(m.group(1), "%y%m%d").date()
+        return d <= _date.today()
+    except ValueError:
+        return False
+
+
 def _find_cached_tex_dir(arxiv_id: str) -> Path | None:
     """返回已下载的 tex 解压目录路径; 没有则 None. 不发请求.
 
     优先精确 dir_id 命中, 退化到 dir_id_<title> glob (fetch_tex_source 解压后
     会把 title slug 加进目录名). 命名规则与 fetch_tex_source / cmd_tex 必须
-    保持一致 — 三处共享此 helper.
+    保持一致 — 三处共享此 helper. 跳过 __YYMMDD 归档目录.
     """
     clean_id = extract_arxiv_id(arxiv_id)
     dir_id = re.sub(r"v\d+$", "", clean_id).replace("/", "_")
@@ -801,12 +819,12 @@ def _find_cached_tex_dir(arxiv_id: str) -> Path | None:
     if exact.is_dir():
         return exact
     for p in OUTPUT_DIR.glob(f"{dir_id}_*"):
-        if p.is_dir():
+        if p.is_dir() and not _is_archived_tex_dir(p.name):
             return p
     return None
 
 
-def fetch_tex_source(arxiv_id: str, output_dir: Path) -> Path | None:
+def fetch_tex_source(arxiv_id: str, output_dir: Path, *, force_refresh: bool = False) -> Path | None:
     """下载 arXiv LaTeX 源文件并解压
 
     不调用 API，直接从 e-print 下载源文件。目录名使用 arXiv ID，
@@ -815,6 +833,7 @@ def fetch_tex_source(arxiv_id: str, output_dir: Path) -> Path | None:
     Args:
         arxiv_id: arXiv ID
         output_dir: 输出目录
+        force_refresh: 强制刷新（忽略 TTL）
 
     Returns:
         解压后的目录路径，失败返回 None
@@ -826,13 +845,38 @@ def fetch_tex_source(arxiv_id: str, output_dir: Path) -> Path | None:
     dir_id = re.sub(r"v\d+$", "", clean_id).replace("/", "_")
     target_dir = output_dir / dir_id
 
+    def _check_and_maybe_archive(candidate: Path) -> Path | None:
+        """TTL 内直接返回; 过期/force_refresh 则 rename 归档, 返回 None 触发重新下载."""
+        try:
+            mtime = candidate.stat().st_mtime
+        except OSError:
+            return candidate
+        age = _datetime.now() - _datetime.fromtimestamp(mtime)
+        if not force_refresh:
+            if CACHE_TTL_DAYS <= 0:
+                return candidate
+            if age <= _timedelta(days=CACHE_TTL_DAYS):
+                return candidate
+        archive_suffix = _datetime.now().strftime("%y%m%d")
+        archived_name = f"{candidate.name}__{archive_suffix}"
+        archived_path = candidate.parent / archived_name
+        reason = "--refresh" if force_refresh else f"expired ({age.days}d old)"
+        print(f"Cache {reason}, archiving: {candidate.name} → {archived_name}")
+        os.rename(candidate, archived_path)
+        return None
+
     if target_dir.exists():
-        print(f"Already exists: {target_dir}")
-        return target_dir
-    existing = [p for p in output_dir.glob(f"{dir_id}_*") if p.is_dir()]
+        result = _check_and_maybe_archive(target_dir)
+        if result:
+            print(f"Already exists: {result}")
+            return result
+    existing = [p for p in output_dir.glob(f"{dir_id}_*")
+                if p.is_dir() and not _is_archived_tex_dir(p.name)]
     if existing:
-        print(f"Already exists: {existing[0]}")
-        return existing[0]
+        result = _check_and_maybe_archive(existing[0])
+        if result:
+            print(f"Already exists: {result}")
+            return result
 
     source_url = f"https://arxiv.org/e-print/{clean_id}"
     print(f"Downloading source: {source_url}")
@@ -1146,6 +1190,59 @@ def _fetch_citations_s2(
     return results[:max_results], paper_info["citationCount"]
 
 
+def _fetch_references_s2(
+    arxiv_id: str, max_results: int, offset: int = 0
+) -> tuple[list[dict], int | None] | None:
+    """从 Semantic Scholar 获取该论文引用的论文列表。
+
+    Returns:
+        (参考文献列表, 总参考文献数)，失败返回 None
+    """
+    info_url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}"
+    total_references: int | None = None
+    try:
+        resp = _request_with_retry(
+            requests.get,
+            info_url,
+            service="s2",
+            params={"fields": "title,referenceCount"},
+            headers=_s2_headers(),
+            timeout=30,
+        )
+        paper_info = resp.json()
+        print(f"Paper: {paper_info['title']}")
+        total_references = paper_info.get("referenceCount")
+        if total_references is not None:
+            print(f"Total references: {total_references}")
+    except requests.RequestException as e:
+        print(f"Semantic Scholar query failed: {_brief_error(e)}", file=sys.stderr)
+        return None
+
+    references_url = f"{S2_API_BASE}/paper/ArXiv:{arxiv_id}/references"
+    try:
+        resp = _request_with_retry(
+            requests.get,
+            references_url,
+            service="s2",
+            params={
+                "fields": "title,year,externalIds,citationCount,authors",
+                "offset": offset,
+                "limit": min(max_results, 1000),
+            },
+            headers=_s2_headers(),
+            timeout=30,
+        )
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"Semantic Scholar references fetch failed: {_brief_error(e)}", file=sys.stderr)
+        return None
+
+    results = [
+        item["citedPaper"] for item in data["data"] if item["citedPaper"]["title"]
+    ]
+    return results[:max_results], total_references
+
+
 def _openalex_params(**extra) -> dict[str, str]:
     if OPENALEX_API_KEY:
         extra["api_key"] = OPENALEX_API_KEY
@@ -1300,11 +1397,36 @@ def cmd_cited(args):
         _print_citations_openalex(results, start_num)
 
 
+def cmd_references(args):
+    clean_id = extract_arxiv_id(args.arxiv_id)
+    offset = args.offset
+
+    print(f"Querying Semantic Scholar references: ArXiv:{clean_id}")
+    ret = _fetch_references_s2(clean_id, args.max, offset)
+    if ret is None:
+        print(f"\nNo references found for arXiv:{clean_id}")
+        return
+
+    results, _total = ret
+    if not results:
+        print(f"\nNo references found for arXiv:{clean_id}")
+        return
+
+    _set_source("s2")
+
+    start_num = offset + 1
+    end_num = offset + len(results)
+    print("\nSource: Semantic Scholar")
+    print(f"Showing references #{start_num}-{end_num}:\n")
+    _print_citations_s2(results, start_num)
+
+
 def cmd_tex(args):
+    refresh = getattr(args, "refresh", False)
     # Audit: 判断是否 cache hit (fetch_tex_source 前已存在目录).
     _was_cached = _find_cached_tex_dir(args.arxiv_id) is not None
 
-    result = fetch_tex_source(args.arxiv_id, OUTPUT_DIR)
+    result = fetch_tex_source(args.arxiv_id, OUTPUT_DIR, force_refresh=refresh)
     if result:
         _set_source("cache" if _was_cached else "arxiv")
         print("\nDirectory structure:")
@@ -1341,6 +1463,7 @@ def main():
     %(prog)s cited 1711.10561 --max 50
     %(prog)s cited 1711.10561 --offset 20          # 第 21-40 条
     %(prog)s cited 1711.10561 --source openalex
+    %(prog)s references 1711.10561
 """,
     )
 
@@ -1374,6 +1497,7 @@ def main():
     # info 子命令
     info_parser = subparsers.add_parser("info", help="获取论文信息（不下载全文）")
     info_parser.add_argument("arxiv_id", help="arXiv ID")
+    info_parser.add_argument("--refresh", action="store_true", help="force re-fetch now (default: auto-refresh after 7 days)")
     info_parser.set_defaults(func=cmd_info)
 
     # bib 子命令
@@ -1399,14 +1523,27 @@ def main():
     )
     cited_parser.set_defaults(func=cmd_cited)
 
+    # references 子命令
+    references_parser = subparsers.add_parser("references", help="正引查询：查看该论文引用了哪些论文")
+    references_parser.add_argument("arxiv_id", help="arXiv ID")
+    references_parser.add_argument(
+        "--max", type=int, default=20, help="最大显示条数 (默认 20)"
+    )
+    references_parser.add_argument(
+        "--offset", type=int, default=0, help="跳过前 N 条结果，用于翻页 (默认 0)"
+    )
+    references_parser.set_defaults(func=cmd_references)
+
     # tex 子命令
     tex_parser = subparsers.add_parser("tex", help="下载 LaTeX 源文件并解压")
     tex_parser.add_argument("arxiv_id", help="arXiv ID")
+    tex_parser.add_argument("--refresh", action="store_true", help="force re-fetch now (default: auto-refresh after 7 days)")
     tex_parser.set_defaults(func=cmd_tex)
 
     # infotex 子命令
     infotex_parser = subparsers.add_parser("infotex", help="info + tex 组合：先打印论文信息，再下载 LaTeX")
     infotex_parser.add_argument("arxiv_id", help="arXiv ID")
+    infotex_parser.add_argument("--refresh", action="store_true", help="force re-fetch now (default: auto-refresh after 7 days)")
     infotex_parser.set_defaults(func=cmd_infotex)
 
     args = parser.parse_args()

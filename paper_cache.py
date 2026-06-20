@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-
-import os
 
 CACHE_DIR = Path(os.environ.get("ARXIV_CACHE_DIR", Path(__file__).parent / ".arxiv"))
 DB_PATH = CACHE_DIR / "paper_cache.db"
+CACHE_TTL_DAYS = 7
 
 _CREATE_TABLE_SQL = """\
 CREATE TABLE IF NOT EXISTS papers (
@@ -65,12 +65,20 @@ def get_cached_paper(arxiv_id: str) -> CachedPaper | None:
     conn = _get_conn()
     try:
         row = conn.execute(
-            "SELECT title, authors, abstract, categories, pdf_url FROM papers WHERE arxiv_id = ?",
+            "SELECT title, authors, abstract, categories, pdf_url, cached_at"
+            " FROM papers WHERE arxiv_id = ?",
             (arxiv_id,),
         ).fetchone()
         if row is None:
             return None
-        title, authors_json, abstract, categories_json, pdf_url = row
+        title, authors_json, abstract, categories_json, pdf_url, cached_at = row
+        if CACHE_TTL_DAYS > 0:
+            try:
+                cached_dt = datetime.fromisoformat(cached_at)
+                if datetime.now() - cached_dt > timedelta(days=CACHE_TTL_DAYS):
+                    return None
+            except (ValueError, TypeError):
+                pass
         return CachedPaper(
             title=title,
             authors=[CachedAuthor(name) for name in json.loads(authors_json)],
@@ -86,8 +94,25 @@ def cache_paper(arxiv_id: str, paper: CachedPaper, bibtex: str) -> None:
     conn = _get_conn()
     try:
         with conn:
+            archive_id = f"{arxiv_id}_{datetime.now().strftime('%y%m%d')}"
+            existing = conn.execute(
+                "SELECT 1 FROM papers WHERE arxiv_id = ?", (arxiv_id,),
+            ).fetchone()
+            if existing:
+                already_archived = conn.execute(
+                    "SELECT 1 FROM papers WHERE arxiv_id = ?", (archive_id,),
+                ).fetchone()
+                if not already_archived:
+                    conn.execute(
+                        "UPDATE papers SET arxiv_id = ? WHERE arxiv_id = ?",
+                        (archive_id, arxiv_id),
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM papers WHERE arxiv_id = ?", (arxiv_id,),
+                    )
             conn.execute(
-                """INSERT OR REPLACE INTO papers
+                """INSERT INTO papers
                    (arxiv_id, title, authors, abstract, categories, pdf_url, bibtex, cached_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
