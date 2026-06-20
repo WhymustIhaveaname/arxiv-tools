@@ -61,13 +61,21 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
+def _id_variants(arxiv_id: str) -> tuple[str, ...]:
+    """返回 clean id 和 arxiv: 前缀两种形式, 用于兼容查询."""
+    if arxiv_id.startswith("arxiv:"):
+        return (arxiv_id, arxiv_id[len("arxiv:"):])
+    return (arxiv_id, f"arxiv:{arxiv_id}")
+
+
 def get_cached_paper(arxiv_id: str) -> CachedPaper | None:
     conn = _get_conn()
     try:
+        variants = _id_variants(arxiv_id)
         row = conn.execute(
             "SELECT title, authors, abstract, categories, pdf_url, cached_at"
-            " FROM papers WHERE arxiv_id = ?",
-            (arxiv_id,),
+            " FROM papers WHERE arxiv_id IN (?, ?)",
+            variants,
         ).fetchone()
         if row is None:
             return None
@@ -94,22 +102,26 @@ def cache_paper(arxiv_id: str, paper: CachedPaper, bibtex: str) -> None:
     conn = _get_conn()
     try:
         with conn:
-            archive_id = f"{arxiv_id}_{datetime.now().strftime('%y%m%d')}"
+            date_suffix = datetime.now().strftime("%y%m%d")
+            variants = _id_variants(arxiv_id)
             existing = conn.execute(
-                "SELECT 1 FROM papers WHERE arxiv_id = ?", (arxiv_id,),
+                "SELECT arxiv_id FROM papers WHERE arxiv_id IN (?, ?)",
+                variants,
             ).fetchone()
             if existing:
+                old_id = existing[0]
+                archive_id = f"{old_id}_{date_suffix}"
                 already_archived = conn.execute(
                     "SELECT 1 FROM papers WHERE arxiv_id = ?", (archive_id,),
                 ).fetchone()
                 if not already_archived:
                     conn.execute(
                         "UPDATE papers SET arxiv_id = ? WHERE arxiv_id = ?",
-                        (archive_id, arxiv_id),
+                        (archive_id, old_id),
                     )
                 else:
                     conn.execute(
-                        "DELETE FROM papers WHERE arxiv_id = ?", (arxiv_id,),
+                        "DELETE FROM papers WHERE arxiv_id = ?", (old_id,),
                     )
             conn.execute(
                 """INSERT INTO papers
@@ -133,9 +145,10 @@ def cache_paper(arxiv_id: str, paper: CachedPaper, bibtex: str) -> None:
 def get_cached_bibtex(arxiv_id: str) -> str | None:
     conn = _get_conn()
     try:
+        variants = _id_variants(arxiv_id)
         row = conn.execute(
-            "SELECT bibtex FROM papers WHERE arxiv_id = ?",
-            (arxiv_id,),
+            "SELECT bibtex FROM papers WHERE arxiv_id IN (?, ?)",
+            variants,
         ).fetchone()
         return row[0] if row else None
     finally:

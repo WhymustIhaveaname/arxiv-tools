@@ -301,3 +301,59 @@ class TestCacheArchiveOnRefresh:
         count = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
         conn.close()
         assert count == 1
+
+
+class TestPrefixCompat:
+    """兼容 arxiv: 前缀格式的 ID (其他系统写入)"""
+
+    def test_get_cached_paper_matches_prefixed(self, cache_db):
+        """用 clean id 查询能命中 arxiv: 前缀的行"""
+        cache_paper("arxiv:1706.03762", MOCK_CACHED_PAPER, MOCK_BIBTEX)
+        result = get_cached_paper("1706.03762")
+        assert result is not None
+        assert result.title == MOCK_CACHED_PAPER.title
+
+    def test_get_cached_bibtex_matches_prefixed(self, cache_db):
+        """用 clean id 查询 bibtex 能命中 arxiv: 前缀的行"""
+        cache_paper("arxiv:1706.03762", MOCK_CACHED_PAPER, MOCK_BIBTEX)
+        assert get_cached_bibtex("1706.03762") == MOCK_BIBTEX
+
+    def test_clean_id_preferred_over_prefixed(self, cache_db):
+        """同时存在两种格式时, clean id 行优先"""
+        old = CachedPaper(title="Old Prefixed", authors=[CachedAuthor("A")])
+        cache_paper("arxiv:1706.03762", old, "@misc{old}")
+        new = CachedPaper(title="New Clean", authors=[CachedAuthor("B")])
+        cache_paper("1706.03762", new, "@misc{new}")
+        result = get_cached_paper("1706.03762")
+        assert result.title == "New Clean"
+
+    def test_archive_prefixed_row_on_refresh(self, cache_db):
+        """cache_paper 刷新时归档带前缀的旧行"""
+        cache_paper("arxiv:1706.03762", MOCK_CACHED_PAPER, MOCK_BIBTEX)
+
+        # 倒拨使其过期
+        stale_time = (datetime.now() - timedelta(days=CACHE_TTL_DAYS + 1)).isoformat()
+        conn = sqlite3.connect(cache_db)
+        conn.execute("UPDATE papers SET cached_at = ? WHERE arxiv_id = ?",
+                     (stale_time, "arxiv:1706.03762"))
+        conn.commit()
+        conn.close()
+
+        updated = CachedPaper(title="V2", authors=[CachedAuthor("X")])
+        cache_paper("1706.03762", updated, "@misc{v2}")
+
+        # 新行存在
+        result = get_cached_paper("1706.03762")
+        assert result is not None
+        assert result.title == "V2"
+
+        # 旧行被归档 (带前缀 + _YYMMDD)
+        today = datetime.now().strftime("%y%m%d")
+        conn = sqlite3.connect(cache_db)
+        row = conn.execute(
+            "SELECT title FROM papers WHERE arxiv_id = ?",
+            (f"arxiv:1706.03762_{today}",),
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row[0] == MOCK_CACHED_PAPER.title
